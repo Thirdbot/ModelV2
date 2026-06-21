@@ -1,0 +1,3 @@
+[submodule "section-seeker"]
+	path = section-seeker
+	url = https://github.com/thinkonward/section-seeker.git
