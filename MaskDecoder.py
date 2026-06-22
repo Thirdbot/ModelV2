@@ -1,3 +1,0 @@
-"""
-Specifically for MaskDecoder
-"""
