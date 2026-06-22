@@ -98,37 +98,17 @@ class SeismicVlmCollator:
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
         full_records: list[dict[str, Any]] = []
-        texts: list[str] = []
-        prompt_texts: list[str] = []
 
         for example_index, example in enumerate(examples):
             record = self._example_to_full_record(example, example_index)
             if not record["regions"] and not self.include_empty_rows:
                 continue
             full_records.append(record)
-            texts.append(record["text"])
-            prompt_texts.append(record["prompt_text"])
 
         if not full_records:
             raise ValueError("Collator produced no full-image records. Check regions or set include_empty_rows=True.")
 
-        tokenized = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt",
-        )
-
-        labels = tokenized["input_ids"].clone()
-        if self.tokenizer.pad_token_id is not None:
-            labels[labels == self.tokenizer.pad_token_id] = -100
-        prompt_lengths = [
-            len(self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
-            for prompt_text in prompt_texts
-        ]
-        for row_idx, prompt_length in enumerate(prompt_lengths):
-            labels[row_idx, :prompt_length] = -100
+        tokenized = self._tokenize_records(full_records)
 
         return {
             "pixel_values": [record["images"] for record in full_records],
@@ -136,11 +116,70 @@ class SeismicVlmCollator:
             "regions": [record["regions"] for record in full_records],
             "input_ids": tokenized["input_ids"],
             "attention_mask": tokenized["attention_mask"],
-            "labels": labels,
+            "labels": tokenized["labels"],
             "meta": [record["meta"] for record in full_records],
-            "text": texts,
-            "prompt_text": prompt_texts,
+            "text": [record["text"] for record in full_records],
+            "prompt_text": [record["prompt_text"] for record in full_records],
             "target_xml": [record["target_xml"] for record in full_records],
+        }
+
+    def _tokenize_records(self, records: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        max_length = self.max_length or 1024
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("Tokenizer needs either pad_token_id or eos_token_id.")
+
+        batch_input_ids = []
+        batch_labels = []
+        for record in records:
+            prompt_ids = self.tokenizer(
+                record["prompt_text"],
+                add_special_tokens=False,
+            )["input_ids"]
+            target_text = record["target_xml"]
+            if self.tokenizer.eos_token:
+                target_text = f"{target_text}{self.tokenizer.eos_token}"
+            target_ids = self.tokenizer(
+                target_text,
+                add_special_tokens=False,
+            )["input_ids"]
+
+            if not target_ids:
+                raise ValueError("Grounding VQA target produced no tokens.")
+
+            if len(target_ids) >= max_length:
+                target_ids = target_ids[:max_length]
+                prompt_ids = []
+            else:
+                prompt_budget = max_length - len(target_ids)
+                prompt_ids = prompt_ids[-prompt_budget:]
+
+            input_ids = prompt_ids + target_ids
+            labels = [-100] * len(prompt_ids) + target_ids
+            if all(label == -100 for label in labels):
+                raise ValueError(
+                    "All text labels were masked. Increase max_length or reduce max_objects/evidence length."
+                )
+            batch_input_ids.append(input_ids)
+            batch_labels.append(labels)
+
+        batch_max_length = max(len(input_ids) for input_ids in batch_input_ids)
+        input_tensor = torch.full((len(records), batch_max_length), pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(records), batch_max_length), dtype=torch.long)
+        label_tensor = torch.full((len(records), batch_max_length), -100, dtype=torch.long)
+
+        for row_idx, (input_ids, labels) in enumerate(zip(batch_input_ids, batch_labels)):
+            length = len(input_ids)
+            input_tensor[row_idx, :length] = torch.tensor(input_ids, dtype=torch.long)
+            attention_mask[row_idx, :length] = 1
+            label_tensor[row_idx, :length] = torch.tensor(labels, dtype=torch.long)
+
+        return {
+            "input_ids": input_tensor,
+            "attention_mask": attention_mask,
+            "labels": label_tensor,
         }
 
     def _example_to_full_record(self, example: dict[str, Any], example_index: int) -> dict[str, Any]:
