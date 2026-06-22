@@ -585,30 +585,39 @@ class VLM(PreTrainedModel):
         )[0, 0]
         return torch.nan_to_num(mask_logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
 
-    def mask_criterion(self, logits, targets):
+    def mask_criterion(self, logits, targets, valid_mask=None):
         logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
         targets = torch.nan_to_num(targets.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+        if valid_mask is None:
+            valid_mask = torch.ones_like(targets)
+        else:
+            valid_mask = torch.nan_to_num(valid_mask.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+        targets = targets * valid_mask
 
         flat_targets = targets.flatten(start_dim=1)
+        flat_valid = valid_mask.flatten(start_dim=1)
         positives = flat_targets.sum(dim=1)
-        valid_objects = positives > 0
+        valid_pixels = flat_valid.sum(dim=1)
+        valid_objects = (positives > 0) & (valid_pixels > 0)
         if not valid_objects.any():
             zero = logits.sum() * 0.0
             return zero, zero, zero
 
         logits = logits[valid_objects]
         targets = targets[valid_objects]
+        valid_mask = valid_mask[valid_objects]
         positives = positives[valid_objects]
-        negatives = targets[0].numel() - positives
+        valid_pixels = valid_pixels[valid_objects]
+        negatives = valid_pixels - positives
         pos_weight = (negatives / positives.clamp_min(1.0)).clamp(min=1.0, max=20.0)
 
         bce_per_pixel = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         weights = torch.ones_like(targets)
         weight_shape = [pos_weight.shape[0]] + [1] * (targets.ndim - 1)
         weights = torch.where(targets > 0, pos_weight.view(*weight_shape), weights)
-        bce_loss = (bce_per_pixel * weights).flatten(start_dim=1).mean(dim=1).mean()
+        bce_loss = ((bce_per_pixel * weights * valid_mask).flatten(start_dim=1).sum(dim=1) / valid_pixels.clamp_min(1.0)).mean()
 
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits) * valid_mask
         smooth = 1.0
         reduce_dims = tuple(range(1, probs.ndim))
         intersection = (probs * targets).sum(dim=reduce_dims)
@@ -643,6 +652,7 @@ class VLM(PreTrainedModel):
         mask_logits = image_embeds.new_zeros(batch_size, num_objects, self.height, self.width)
         bbox_targets = image_embeds.new_zeros(batch_size, num_objects, 4)
         mask_targets = image_embeds.new_zeros(batch_size, num_objects, self.height, self.width)
+        mask_valid_targets = image_embeds.new_zeros(batch_size, num_objects, self.height, self.width)
         object_mask = torch.zeros(batch_size, num_objects, dtype=torch.bool, device=device)
 
         for batch_idx, batch_regions in enumerate(regions):
@@ -660,6 +670,12 @@ class VLM(PreTrainedModel):
 
                 bbox_targets[batch_idx, obj_idx] = self.bbox_to_encoder_frame(region["bbox"], info, device)
                 mask_targets[batch_idx, obj_idx] = self._resize_pad_mask(masks[batch_idx][mask_index], info, device)
+                mask_valid_targets[
+                    batch_idx,
+                    obj_idx,
+                    : int(info["resized_h"]),
+                    : int(info["resized_w"]),
+                ] = 1.0
                 mask_logits[batch_idx, obj_idx] = self.decode_mask_from_patches(
                     object_embed=object_embeds[batch_idx, obj_idx],
                     image_embed=info["embeds"],
@@ -678,6 +694,7 @@ class VLM(PreTrainedModel):
             mask_loss, mask_bce_loss, mask_dice_loss = self.mask_criterion(
                 mask_logits[object_mask],
                 mask_targets[object_mask],
+                valid_mask=mask_valid_targets[object_mask],
             )
             grounding_loss = self.bbox_loss_weight * bbox_loss + self.mask_loss_weight * mask_loss
             grounding_loss = torch.nan_to_num(grounding_loss, nan=0.0, posinf=0.0, neginf=0.0)
@@ -687,6 +704,7 @@ class VLM(PreTrainedModel):
             "mask_logits": mask_logits,
             "bbox_targets": bbox_targets,
             "mask_targets": mask_targets,
+            "mask_valid_targets": mask_valid_targets,
             "object_mask": object_mask,
             "grounding_loss": grounding_loss,
             "bbox_loss": bbox_loss,
