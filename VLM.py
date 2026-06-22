@@ -567,6 +567,8 @@ class VLM(PreTrainedModel):
     def decode_mask_from_patches(self, object_embed, image_embed):
         patch_embeds = self.mask_patch_head(image_embed[1:].float())
         object_embed = self.mask_object_head(object_embed.float())
+        patch_embeds = torch.nan_to_num(patch_embeds, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        object_embed = torch.nan_to_num(object_embed, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
         patch_count = patch_embeds.shape[0]
         grid_size = int(patch_count ** 0.5)
         if grid_size * grid_size != patch_count:
@@ -575,19 +577,36 @@ class VLM(PreTrainedModel):
         conditioned = patch_grid * object_embed.view(1, 1, -1)
         conditioned = conditioned.permute(2, 0, 1).unsqueeze(0)
         slot_mask_logits = self.mask_decoder(conditioned)[0, 0]
-        return F.interpolate(
+        mask_logits = F.interpolate(
             slot_mask_logits.unsqueeze(0).unsqueeze(0),
             size=(self.height, self.width),
             mode="bilinear",
             align_corners=False,
         )[0, 0]
+        return torch.nan_to_num(mask_logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
 
     def mask_criterion(self, logits, targets):
-        targets = targets.float()
-        positives = targets.sum()
-        negatives = targets.numel() - positives
-        pos_weight = (negatives / positives.clamp_min(1.0)).clamp(min=1.0, max=100.0)
-        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        targets = torch.nan_to_num(targets.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(min=0.0, max=1.0)
+
+        flat_targets = targets.flatten(start_dim=1)
+        positives = flat_targets.sum(dim=1)
+        valid_objects = positives > 0
+        if not valid_objects.any():
+            zero = logits.sum() * 0.0
+            return zero, zero, zero
+
+        logits = logits[valid_objects]
+        targets = targets[valid_objects]
+        positives = positives[valid_objects]
+        negatives = targets[0].numel() - positives
+        pos_weight = (negatives / positives.clamp_min(1.0)).clamp(min=1.0, max=20.0)
+
+        bce_per_pixel = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        weights = torch.ones_like(targets)
+        weight_shape = [pos_weight.shape[0]] + [1] * (targets.ndim - 1)
+        weights = torch.where(targets > 0, pos_weight.view(*weight_shape), weights)
+        bce_loss = (bce_per_pixel * weights).flatten(start_dim=1).mean(dim=1).mean()
 
         probs = torch.sigmoid(logits)
         smooth = 1.0
@@ -597,7 +616,11 @@ class VLM(PreTrainedModel):
         dice_loss = 1.0 - ((2.0 * intersection + smooth) / (denominator + smooth))
         dice_loss = dice_loss.mean()
 
-        return bce_loss + dice_loss, bce_loss, dice_loss
+        mask_loss = bce_loss + dice_loss
+        mask_loss = torch.nan_to_num(mask_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        bce_loss = torch.nan_to_num(bce_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        dice_loss = torch.nan_to_num(dice_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        return mask_loss, bce_loss, dice_loss
 
     def forward_full_image_grounding(self, image_embeds, masks, regions, object_embeds=None):
         if self._last_image_infos is None:
@@ -650,12 +673,14 @@ class VLM(PreTrainedModel):
         mask_dice_loss = None
         if object_mask.any():
             bbox_unit_targets = bbox_targets / float(self.width)
-            bbox_loss = F.l1_loss(bbox_unit_preds[object_mask], bbox_unit_targets[object_mask])
+            bbox_loss = F.smooth_l1_loss(bbox_unit_preds[object_mask], bbox_unit_targets[object_mask], beta=0.05)
+            bbox_loss = torch.nan_to_num(bbox_loss, nan=0.0, posinf=0.0, neginf=0.0)
             mask_loss, mask_bce_loss, mask_dice_loss = self.mask_criterion(
                 mask_logits[object_mask],
                 mask_targets[object_mask],
             )
             grounding_loss = self.bbox_loss_weight * bbox_loss + self.mask_loss_weight * mask_loss
+            grounding_loss = torch.nan_to_num(grounding_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
             "bbox_preds": bbox_preds,
@@ -754,6 +779,8 @@ class VLM(PreTrainedModel):
 
         patch_embeds = self.mask_patch_head(patch_embeds)
         object_mask_embeds = self.mask_object_head(object_embeds)
+        patch_embeds = torch.nan_to_num(patch_embeds, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
+        object_mask_embeds = torch.nan_to_num(object_mask_embeds, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
         patch_count = patch_embeds.shape[1]
         grid_size = int(patch_count ** 0.5)
         if grid_size * grid_size != patch_count:
@@ -770,6 +797,7 @@ class VLM(PreTrainedModel):
             mode="bilinear",
             align_corners=False,
         )
+        mask_logits = torch.nan_to_num(mask_logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
 
         grounding_loss = image_embeds.new_tensor(0.0)
         bbox_loss = None
@@ -785,7 +813,8 @@ class VLM(PreTrainedModel):
         if bbox_targets is not None and object_mask.any():
             bbox_targets = bbox_targets[:, :num_objects].to(image_embeds.device).float()
             bbox_unit_targets = bbox_targets / float(self.width)
-            bbox_loss = F.l1_loss(bbox_unit_preds[object_mask], bbox_unit_targets[object_mask])
+            bbox_loss = F.smooth_l1_loss(bbox_unit_preds[object_mask], bbox_unit_targets[object_mask], beta=0.05)
+            bbox_loss = torch.nan_to_num(bbox_loss, nan=0.0, posinf=0.0, neginf=0.0)
             grounding_loss = grounding_loss + self.bbox_loss_weight * bbox_loss
 
         if mask_targets is not None and object_mask.any():
@@ -795,6 +824,7 @@ class VLM(PreTrainedModel):
                 mask_targets[object_mask],
             )
             grounding_loss = grounding_loss + self.mask_loss_weight * mask_loss
+            grounding_loss = torch.nan_to_num(grounding_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
             "bbox_preds": bbox_preds,

@@ -11,6 +11,12 @@ CONFIG = TrainConfig(
     max_train_samples=None,
     max_eval_samples=None,
     max_length=256,
+    text_loss_weight=1.0,
+    bbox_loss_weight=1.0,
+    mask_loss_weight=2.0,
+    max_grad_norm=1.0,
+    fp16=False,
+    bf16=False,
     save_only_model=False,
     use_wandb=True,
 )

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import torch
 from datasets import load_dataset
 from transformers import AutoProcessor, Trainer, TrainingArguments
 
@@ -16,6 +17,14 @@ class SeismicTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+        if not torch.isfinite(loss):
+            details = {}
+            if isinstance(outputs, dict):
+                for key in ("text_loss", "grounding_loss", "bbox_loss", "mask_loss", "mask_bce_loss", "mask_dice_loss"):
+                    value = outputs.get(key)
+                    if value is not None:
+                        details[key] = value.detach().float().cpu().item()
+            raise FloatingPointError(f"Non-finite training loss: {details}")
 
         if model.training and isinstance(outputs, dict):
             logs = {}
@@ -62,6 +71,7 @@ class TrainConfig:
     per_device_train_batch_size: int = 1
     per_device_eval_batch_size: int = 1
     gradient_accumulation_steps: int = 1
+    max_grad_norm: float = 1.0
     logging_steps: int = 1
     eval_steps: int = 1
     save_steps: int = 1
@@ -181,6 +191,7 @@ def build_training_arguments(config: TrainConfig, training_type: str) -> Trainin
         per_device_train_batch_size=config.per_device_train_batch_size,
         per_device_eval_batch_size=config.per_device_eval_batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
+        max_grad_norm=config.max_grad_norm,
         logging_steps=config.logging_steps,
         eval_strategy="epoch",
         eval_steps=config.eval_steps,
