@@ -45,14 +45,15 @@ class TrainConfig:
     run_name: str = "test_drive"
     test_size: float = 0.2
     seed: int = 42
-    max_internal_tiles: int = 64
-    internal_tile_stride: int = 112
     max_objects: int = 10
     max_length: int = 256
-    include_empty_tiles: bool = False
+    text_loss_weight: float = 1.0
+    bbox_loss_weight: float = 1.0
+    mask_loss_weight: float = 1.0
+    include_empty_rows: bool = False
     max_train_samples: int | None = 1
     max_eval_samples: int | None = 1
-    filter_empty_tile_rows: bool = True
+    filter_empty_region_rows: bool = True
     num_train_epochs: float = 1.0
     max_steps: int = 1
     learning_rate: float = 2e-5
@@ -98,8 +99,9 @@ def build_tokenizer_and_model(config: TrainConfig, special_tokens: list[str] | N
         decoder_name_or_path=config.decoder,
         tokenizer=tokenizer,
         max_detection_slots=config.max_objects,
-        max_internal_tiles=config.max_internal_tiles,
-        internal_tile_stride=config.internal_tile_stride,
+        text_loss_weight=config.text_loss_weight,
+        bbox_loss_weight=config.bbox_loss_weight,
+        mask_loss_weight=config.mask_loss_weight,
     )
 
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
@@ -110,6 +112,8 @@ def build_tokenizer_and_model(config: TrainConfig, special_tokens: list[str] | N
         "<SEG>",
         "<region>",
         "</region>",
+        "<image_index>",
+        "</image_index>",
         "<object>",
         "</object>",
         "<class_id>",
@@ -150,7 +154,7 @@ def build_collator(config: TrainConfig, tokenizer: Any):
     return SeismicVlmCollator(
         tokenizer=tokenizer,
         image_token="<image>",
-        include_empty_tiles=config.include_empty_tiles,
+        include_empty_rows=config.include_empty_rows,
         max_objects=config.max_objects,
         max_length=config.max_length,
     )
@@ -195,9 +199,9 @@ def build_trainer(config: TrainConfig, training_type: str) -> Trainer:
     train_dataset, eval_dataset = load_splits(config)
     tokenizer, model = build_tokenizer_and_model(config)
     collator = build_collator(config, tokenizer)
-    if config.filter_empty_tile_rows:
-        train_dataset = filter_empty_tile_rows(train_dataset, collator)
-        eval_dataset = filter_empty_tile_rows(eval_dataset, collator)
+    if config.filter_empty_region_rows:
+        train_dataset = filter_empty_region_rows(train_dataset, collator)
+        eval_dataset = filter_empty_region_rows(eval_dataset, collator)
     training_args = build_training_arguments(config, training_type)
 
     return SeismicTrainer(
@@ -210,11 +214,11 @@ def build_trainer(config: TrainConfig, training_type: str) -> Trainer:
     )
 
 
-def filter_empty_tile_rows(dataset, collator):
-    def has_tiles(example):
+def filter_empty_region_rows(dataset, collator):
+    def has_regions(example):
         return len(collator._example_to_full_record(example, example_index=0)["regions"]) > 0
 
-    filtered = dataset.filter(has_tiles)
+    filtered = dataset.filter(has_regions)
     if len(filtered) == 0:
         raise ValueError("No dataset rows contain regions with the current collator settings.")
     return filtered

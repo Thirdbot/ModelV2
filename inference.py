@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 import torch
 from datasets import load_dataset
+from PIL import Image, ImageDraw
 from safetensors.torch import load_file
 from transformers import AutoProcessor
 
 from Collator import image_to_tensor
+from GroundingVQAFormatter import GroundingVQAFormatter
 from train_common import TrainConfig
 from VLM import VLM
 
@@ -21,8 +24,6 @@ CONFIG = TrainConfig(
     test_size=0.2,
     seed=42,
     max_objects=10,
-    max_internal_tiles=8,
-    internal_tile_stride=112,
     max_length=512,
 )
 
@@ -30,6 +31,9 @@ CHECKPOINT_DIR = "outputs/masks/text_mask_output/train_100/checkpoint-1900"
 TEST_INDEX = 0
 MAX_NEW_TOKENS = 64
 OUTPUT_JSON = "inference_outputs.json"
+OUTPUT_DIR = "inference_rendered"
+MASK_THRESHOLD = 0.5
+OVERLAY_ALPHA = 110
 FORCE_CPU = False
 DEVICE = "cpu" if FORCE_CPU else ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -38,6 +42,8 @@ SPECIAL_TOKENS = [
     "<SEG>",
     "<region>",
     "</region>",
+    "<image_index>",
+    "</image_index>",
     "<object>",
     "</object>",
     "<class_id>",
@@ -92,8 +98,6 @@ def load_model_and_tokenizer(config: TrainConfig) -> tuple[VLM, Any]:
         decoder_name_or_path=config.decoder,
         tokenizer=tokenizer,
         max_detection_slots=config.max_objects,
-        max_internal_tiles=config.max_internal_tiles,
-        internal_tile_stride=config.internal_tile_stride,
     )
     if model.decoder.get_input_embeddings().num_embeddings != len(tokenizer):
         model.resize_token_embeddings(len(tokenizer))
@@ -127,39 +131,110 @@ def filter_loadable_state_dict(model: VLM, state_dict: dict[str, torch.Tensor]) 
 
 
 def build_prompt(tokenizer: Any, row: dict[str, Any], image_tensors: list[torch.Tensor]) -> str:
-    image_tokens = "\n".join(["<image>" for _ in image_tensors])
-    image_sizes = "\n".join(
-        [
-            f"Image {idx}: width={int(image.shape[2])}, height={int(image.shape[1])}."
-            for idx, image in enumerate(image_tensors)
-        ]
-    )
-    question = row.get("question") or "Find and describe the seismic evidence. Return XML regions with evidence, bbox, and <SEG>."
-    prompt_content = (
-        f"{image_tokens}\n"
-        "These are full seismic images. The model will tile them internally for the vision encoder.\n"
-        f"{image_sizes}\n"
-        "Return all <bbox> coordinates in full-image coordinates.\n"
-        f"{question}"
-    )
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt_content}],
-        add_generation_prompt=True,
-        tokenize=False,
-    )
+    formatter = GroundingVQAFormatter(tokenizer=tokenizer, image_token="<image>")
+    question = row.get("question") or "Find and describe the seismic evidence."
+    return formatter.build_prompt(prompt=question, images=image_tensors)
 
 
-def local_bbox_to_global(local_bbox: list[float], tile_meta: dict[str, Any]) -> list[int]:
-    x0 = int(tile_meta["x0"])
-    y0 = int(tile_meta["y0"])
-    orig_w = int(tile_meta["orig_w"])
-    orig_h = int(tile_meta["orig_h"])
+def encoder_bbox_to_global(local_bbox: list[float], image_meta: dict[str, Any]) -> list[int]:
+    orig_w = int(image_meta["orig_w"])
+    orig_h = int(image_meta["orig_h"])
+    scale = float(image_meta["scale"])
+    x1 = max(0, min(orig_w, round(local_bbox[0] / scale)))
+    y1 = max(0, min(orig_h, round(local_bbox[1] / scale)))
+    x2 = max(0, min(orig_w, round(local_bbox[2] / scale)))
+    y2 = max(0, min(orig_h, round(local_bbox[3] / scale)))
     return [
-        max(0, min(orig_w, round(local_bbox[0] + x0))),
-        max(0, min(orig_h, round(local_bbox[1] + y0))),
-        max(0, min(orig_w, round(local_bbox[2] + x0))),
-        max(0, min(orig_h, round(local_bbox[3] + y0))),
+        min(x1, x2),
+        min(y1, y2),
+        max(x1, x2),
+        max(y1, y2),
     ]
+
+
+def parse_grounding_image_indices(text: str, max_objects: int, default_index: int = 0) -> list[int]:
+    matches = re.findall(r"<image_index>\s*(\d+)\s*</image_index>", text)
+    indices = [int(value) for value in matches[:max_objects]]
+    if not indices:
+        indices = [default_index]
+    while len(indices) < max_objects:
+        indices.append(indices[-1])
+    return indices
+
+
+def tensor_to_pil(image: torch.Tensor) -> Image.Image:
+    image = image.detach().cpu().clamp(0, 1)
+    image = (image * 255).to(torch.uint8)
+    if image.shape[0] == 1:
+        image = image.repeat(3, 1, 1)
+    return Image.fromarray(image.permute(1, 2, 0).numpy(), mode="RGB")
+
+
+def render_mask_overlays(
+    image_tensors: list[torch.Tensor],
+    mask_logits: torch.Tensor,
+    image_meta: list[dict[str, Any]],
+    global_bboxes: list[list[int]],
+) -> list[str]:
+    output_dir = Path(OUTPUT_DIR)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    colors = [
+        (255, 0, 0, OVERLAY_ALPHA),
+        (0, 180, 255, OVERLAY_ALPHA),
+        (255, 220, 0, OVERLAY_ALPHA),
+        (0, 220, 120, OVERLAY_ALPHA),
+        (180, 90, 255, OVERLAY_ALPHA),
+        (255, 120, 0, OVERLAY_ALPHA),
+    ]
+
+    base_images = [tensor_to_pil(image).convert("RGBA") for image in image_tensors]
+    overlays = [Image.new("RGBA", image.size, (0, 0, 0, 0)) for image in base_images]
+
+    mask_probs = mask_logits.detach().sigmoid().cpu()
+    for slot_idx, mask_prob in enumerate(mask_probs):
+        if not image_meta:
+            continue
+        meta = image_meta[min(slot_idx, len(image_meta) - 1)]
+        image_index = int(meta["image_index"])
+        if image_index >= len(overlays):
+            continue
+
+        orig_w = int(meta["orig_w"])
+        orig_h = int(meta["orig_h"])
+        resized_w = int(meta["resized_w"])
+        resized_h = int(meta["resized_h"])
+        mask = (mask_prob > MASK_THRESHOLD).to(torch.uint8) * 255
+        mask_img = Image.fromarray(mask.numpy(), mode="L").crop((0, 0, resized_w, resized_h))
+        if resized_w == 0 or resized_h == 0:
+            continue
+
+        mask_img = mask_img.resize((orig_w, orig_h), resample=Image.Resampling.NEAREST)
+        color = colors[slot_idx % len(colors)]
+        color_img = Image.new("RGBA", mask_img.size, color)
+        overlays[image_index].paste(color_img, (0, 0), mask_img)
+
+    saved_paths = []
+    for image_index, base in enumerate(base_images):
+        original_path = output_dir / f"test_{TEST_INDEX}_image_{image_index}_original.png"
+        overlay_path = output_dir / f"test_{TEST_INDEX}_image_{image_index}_overlay.png"
+        base.convert("RGB").save(original_path)
+        composed = Image.alpha_composite(base, overlays[image_index])
+
+        draw = ImageDraw.Draw(composed)
+        for slot_idx, bbox in enumerate(global_bboxes):
+            if not image_meta:
+                continue
+            meta = image_meta[min(slot_idx, len(image_meta) - 1)]
+            if int(meta["image_index"]) != image_index:
+                continue
+            color = colors[slot_idx % len(colors)]
+            draw.rectangle(bbox, outline=color[:3], width=2)
+            draw.text((bbox[0], max(0, bbox[1] - 12)), f"slot {slot_idx}", fill=color[:3])
+
+        composed.convert("RGB").save(overlay_path)
+        saved_paths.extend([str(original_path), str(overlay_path)])
+    return saved_paths
 
 
 @torch.no_grad()
@@ -188,26 +263,47 @@ def run_inference() -> dict[str, Any]:
         eos_token_id=tokenizer.eos_token_id,
     )
     generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=False)[0].strip()
+    grounding_image_indices = parse_grounding_image_indices(generated_text, max_objects=CONFIG.max_objects)
+    grounding_text = prompt + generated_text
+    grounding_tokens = tokenizer(
+        [grounding_text],
+        padding=True,
+        truncation=True,
+        max_length=CONFIG.max_length + MAX_NEW_TOKENS,
+        return_tensors="pt",
+    )
+    grounding_tokens = {key: value.to(DEVICE) for key, value in grounding_tokens.items()}
 
-    grounding = model.predict_grounding(
+    grounding = model.predict_grounding_from_text(
         pixel_values=[image_tensors],
-        num_objects=CONFIG.max_objects,
+        input_ids=grounding_tokens["input_ids"],
+        attention_mask=grounding_tokens["attention_mask"],
+        grounding_image_indices=[grounding_image_indices],
     )
     local_bboxes = grounding["bbox_preds"][0].detach().cpu().tolist()
-    tile_meta = grounding.get("tile_meta", [[]])[0]
+    mask_logits = grounding["mask_logits"][0].detach().cpu()
+    image_meta = grounding.get("image_meta", [[]])[0]
     global_bboxes = [
-        local_bbox_to_global(bbox, tile_meta[min(idx, len(tile_meta) - 1)])
+        encoder_bbox_to_global(bbox, image_meta[min(idx, len(image_meta) - 1)])
         for idx, bbox in enumerate(local_bboxes)
-        if tile_meta
+        if image_meta
     ]
+    rendered_paths = render_mask_overlays(
+        image_tensors=image_tensors,
+        mask_logits=mask_logits,
+        image_meta=image_meta,
+        global_bboxes=global_bboxes,
+    )
 
     result = {
         "test_index": TEST_INDEX,
         "question": row.get("question", ""),
         "generated_text": generated_text,
-        "local_bboxes": local_bboxes,
+        "encoder_frame_bboxes": local_bboxes,
         "global_bboxes": global_bboxes,
-        "tile_meta": tile_meta,
+        "image_meta": image_meta,
+        "grounding_image_indices": grounding_image_indices,
+        "rendered_paths": rendered_paths,
         "target_answer": row.get("answer", ""),
         "target_evidence": row.get("evidence", ""),
     }
@@ -221,6 +317,10 @@ print(f"test_index: {result['test_index']}")
 print(result["generated_text"])
 if result["global_bboxes"]:
     print("first_global_bbox_from_head:", result["global_bboxes"][0])
+if result["rendered_paths"]:
+    print("rendered_images:")
+    for path in result["rendered_paths"]:
+        print(path)
 
 with open(OUTPUT_JSON, "w", encoding="utf-8") as file:
     json.dump(result, file, indent=2)
