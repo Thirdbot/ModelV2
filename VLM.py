@@ -612,10 +612,13 @@ class VLM(PreTrainedModel):
         pos_weight = (negatives / positives.clamp_min(1.0)).clamp(min=1.0, max=20.0)
 
         bce_per_pixel = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs_for_focal = torch.sigmoid(logits)
+        pt = torch.where(targets > 0, probs_for_focal, 1.0 - probs_for_focal)
+        focal_weight = (1.0 - pt).pow(2.0)
         weights = torch.ones_like(targets)
         weight_shape = [pos_weight.shape[0]] + [1] * (targets.ndim - 1)
         weights = torch.where(targets > 0, pos_weight.view(*weight_shape), weights)
-        bce_loss = ((bce_per_pixel * weights * valid_mask).flatten(start_dim=1).sum(dim=1) / valid_pixels.clamp_min(1.0)).mean()
+        bce_loss = ((bce_per_pixel * focal_weight * weights * valid_mask).flatten(start_dim=1).sum(dim=1) / valid_pixels.clamp_min(1.0)).mean()
 
         probs = torch.sigmoid(logits) * valid_mask
         smooth = 1.0
@@ -630,6 +633,22 @@ class VLM(PreTrainedModel):
         bce_loss = torch.nan_to_num(bce_loss, nan=0.0, posinf=0.0, neginf=0.0)
         dice_loss = torch.nan_to_num(dice_loss, nan=0.0, posinf=0.0, neginf=0.0)
         return mask_loss, bce_loss, dice_loss
+
+    def bbox_focus_mask(self, bbox, info, device, margin=16):
+        focus = torch.zeros(self.height, self.width, dtype=torch.float32, device=device)
+        x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
+        x1 = max(0, min(int(info["resized_w"]), x1 - margin))
+        y1 = max(0, min(int(info["resized_h"]), y1 - margin))
+        x2 = max(0, min(int(info["resized_w"]), x2 + margin))
+        y2 = max(0, min(int(info["resized_h"]), y2 + margin))
+        if x2 <= x1:
+            x1 = max(0, x1 - margin)
+            x2 = min(int(info["resized_w"]), x1 + 2 * margin + 1)
+        if y2 <= y1:
+            y1 = max(0, y1 - margin)
+            y2 = min(int(info["resized_h"]), y1 + 2 * margin + 1)
+        focus[y1:y2, x1:x2] = 1.0
+        return focus
 
     def forward_full_image_grounding(self, image_embeds, masks, regions, object_embeds=None):
         if self._last_image_infos is None:
@@ -668,14 +687,10 @@ class VLM(PreTrainedModel):
                 if mask_index >= len(masks[batch_idx]):
                     continue
 
-                bbox_targets[batch_idx, obj_idx] = self.bbox_to_encoder_frame(region["bbox"], info, device)
+                bbox_target = self.bbox_to_encoder_frame(region["bbox"], info, device)
+                bbox_targets[batch_idx, obj_idx] = bbox_target
                 mask_targets[batch_idx, obj_idx] = self._resize_pad_mask(masks[batch_idx][mask_index], info, device)
-                mask_valid_targets[
-                    batch_idx,
-                    obj_idx,
-                    : int(info["resized_h"]),
-                    : int(info["resized_w"]),
-                ] = 1.0
+                mask_valid_targets[batch_idx, obj_idx] = self.bbox_focus_mask(bbox_target, info, device)
                 mask_logits[batch_idx, obj_idx] = self.decode_mask_from_patches(
                     object_embed=object_embeds[batch_idx, obj_idx],
                     image_embed=info["embeds"],
