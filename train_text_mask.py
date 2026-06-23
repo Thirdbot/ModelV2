@@ -19,6 +19,8 @@ CONFIG = TrainConfig(
     learning_rate=1e-5,
     max_grad_norm=1.0,
     freeze_encoder=False,
+    # Use this to load old model weights but start a fresh optimizer after architecture changes.
+    # model_init_checkpoint="outputs/text_mask_output/train_100/checkpoint-XXXX",
     fp16=False,
     bf16=False,
     save_only_model=False,

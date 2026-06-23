@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from datasets import load_dataset
+from safetensors.torch import load_file
 from transformers import AutoProcessor, Trainer, TrainingArguments
 
 from Collator import SeismicVlmCollator
@@ -93,6 +94,7 @@ class TrainConfig:
     wandb_project: str = "seismic-vlm"
     wandb_dir: str = "runs/wandb"
     use_wandb: bool = True
+    model_init_checkpoint: str | None = None
     resume_from_checkpoint: str | None = None
 
 
@@ -152,11 +154,52 @@ def build_tokenizer_and_model(config: TrainConfig, special_tokens: list[str] | N
     if num_added > 0:
         model.resize_token_embeddings(len(tokenizer))
 
+    if config.model_init_checkpoint is not None:
+        load_model_weights(model, config.model_init_checkpoint)
+
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
     apply_freezing(model, freeze_encoder=config.freeze_encoder, freeze_decoder=config.freeze_decoder)
     return tokenizer, model
+
+
+def load_model_weights(model: VLM, checkpoint: str) -> None:
+    checkpoint_path = Path(checkpoint)
+    if checkpoint_path.is_dir():
+        safetensors_path = checkpoint_path / "model.safetensors"
+        pytorch_path = checkpoint_path / "pytorch_model.bin"
+    else:
+        safetensors_path = checkpoint_path
+        pytorch_path = checkpoint_path
+
+    if safetensors_path.exists() and safetensors_path.suffix == ".safetensors":
+        state_dict = load_file(str(safetensors_path))
+    elif safetensors_path.exists() and safetensors_path.name == "model.safetensors":
+        state_dict = load_file(str(safetensors_path))
+    elif pytorch_path.exists():
+        state_dict = torch.load(pytorch_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(
+            f"No model weights found at {checkpoint}. Expected model.safetensors or pytorch_model.bin."
+        )
+
+    model_state = model.state_dict()
+    loadable = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key not in model_state or model_state[key].shape != value.shape:
+            skipped.append(key)
+            continue
+        loadable[key] = value
+
+    missing, unexpected = model.load_state_dict(loadable, strict=False)
+    new_missing = [key for key in missing if not key.startswith("mask_refiner.")]
+    print(
+        f"Loaded model_init_checkpoint={checkpoint} "
+        f"loadable={len(loadable)} skipped={len(skipped)} missing_new={len(new_missing)} "
+        f"missing_mask_refiner={len(missing) - len(new_missing)} unexpected={len(unexpected)}"
+    )
 
 
 def apply_freezing(model: VLM, freeze_encoder: bool, freeze_decoder: bool) -> None:
@@ -245,6 +288,11 @@ def filter_empty_region_rows(dataset, collator):
 
 
 def train_from_config(config: TrainConfig, training_type: str) -> None:
+    if config.model_init_checkpoint is not None and config.resume_from_checkpoint is not None:
+        raise ValueError(
+            "Use either model_init_checkpoint for weight-only warm start or "
+            "resume_from_checkpoint for exact Trainer resume, not both."
+        )
     trainer = build_trainer(config, training_type=training_type)
     trainer.train(resume_from_checkpoint=config.resume_from_checkpoint)
     trainer.save_model()
