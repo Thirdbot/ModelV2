@@ -20,7 +20,14 @@ class SeismicTrainer(Trainer):
         if not torch.isfinite(loss):
             details = {}
             if isinstance(outputs, dict):
-                for key in ("text_loss", "grounding_loss", "bbox_loss", "mask_loss", "mask_bce_loss", "mask_dice_loss"):
+                for key in (
+                    "text_loss",
+                    "grounding_loss",
+                    "bbox_loss",
+                    "crop_mask_loss",
+                    "crop_mask_bce_loss",
+                    "crop_mask_dice_loss",
+                ):
                     value = outputs.get(key)
                     if value is not None:
                         details[key] = value.detach().float().cpu().item()
@@ -32,9 +39,9 @@ class SeismicTrainer(Trainer):
                 "text_loss",
                 "grounding_loss",
                 "bbox_loss",
-                "mask_loss",
-                "mask_bce_loss",
-                "mask_dice_loss",
+                "crop_mask_loss",
+                "crop_mask_bce_loss",
+                "crop_mask_dice_loss",
             ):
                 value = outputs.get(key)
                 if value is not None:
@@ -58,7 +65,7 @@ class TrainConfig:
     max_length: int = 256
     text_loss_weight: float = 1.0
     bbox_loss_weight: float = 1.0
-    mask_loss_weight: float = 1.0
+    crop_mask_loss_weight: float = 1.0
     include_empty_rows: bool = False
     max_train_samples: int | None = 1
     max_eval_samples: int | None = 1
@@ -111,7 +118,7 @@ def build_tokenizer_and_model(config: TrainConfig, special_tokens: list[str] | N
         max_detection_slots=config.max_objects,
         text_loss_weight=config.text_loss_weight,
         bbox_loss_weight=config.bbox_loss_weight,
-        mask_loss_weight=config.mask_loss_weight,
+        crop_mask_loss_weight=config.crop_mask_loss_weight,
     )
 
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:

@@ -27,7 +27,7 @@ class VLM(PreTrainedModel):
         image_size=224,
         text_loss_weight=1.0,
         bbox_loss_weight=1.0,
-        mask_loss_weight=1.0,
+        crop_mask_loss_weight=1.0,
         verbose=False,
     ):
         super().__init__(config)
@@ -38,7 +38,7 @@ class VLM(PreTrainedModel):
         self.max_image_slots = max_image_slots
         self.text_loss_weight = text_loss_weight
         self.bbox_loss_weight = bbox_loss_weight
-        self.mask_loss_weight = mask_loss_weight
+        self.crop_mask_loss_weight = crop_mask_loss_weight
         self._last_image_infos = None
 
         if decoder_name_or_path is None:
@@ -101,7 +101,7 @@ class VLM(PreTrainedModel):
         image_size=224,
         text_loss_weight=1.0,
         bbox_loss_weight=1.0,
-        mask_loss_weight=1.0,
+        crop_mask_loss_weight=1.0,
         verbose=False,
     ):
         encoder_config = AutoConfig.from_pretrained(encoder_name_or_path)
@@ -122,7 +122,7 @@ class VLM(PreTrainedModel):
             image_size=image_size,
             text_loss_weight=text_loss_weight,
             bbox_loss_weight=bbox_loss_weight,
-            mask_loss_weight=mask_loss_weight,
+            crop_mask_loss_weight=crop_mask_loss_weight,
             verbose=verbose,
         )
 
@@ -475,7 +475,6 @@ class VLM(PreTrainedModel):
 
         bbox_unit_preds = torch.sigmoid(self.bbox_head(object_embeds))
         bbox_preds = bbox_unit_preds * float(self.width)
-        mask_logits = image_embeds.new_zeros(batch_size, num_objects, self.height, self.width)
         image_meta = []
 
         for batch_idx in range(batch_size):
@@ -488,22 +487,17 @@ class VLM(PreTrainedModel):
                 if grounding_image_indices is not None and obj_idx < len(grounding_image_indices[batch_idx]):
                     image_index = int(grounding_image_indices[batch_idx][obj_idx])
                 info = self.select_image_info(infos, image_index=image_index, fallback_slot=obj_idx)
-                mask_logits[batch_idx, obj_idx] = self.decode_mask_from_patches(
-                    object_embed=object_embeds[batch_idx, obj_idx],
-                    image_embed=info["embeds"],
-                )
                 image_meta[batch_idx].append({key: value for key, value in info.items() if key != "embeds"})
 
         return {
             "bbox_preds": bbox_preds,
-            "mask_logits": mask_logits,
             "image_meta": image_meta,
             "object_embeds": object_embeds,
             "grounding_loss": None,
             "bbox_loss": None,
-            "mask_loss": None,
-            "mask_bce_loss": None,
-            "mask_dice_loss": None,
+            "crop_mask_loss": None,
+            "crop_mask_bce_loss": None,
+            "crop_mask_dice_loss": None,
         }
 
     @torch.no_grad()
@@ -578,7 +572,6 @@ class VLM(PreTrainedModel):
         labels=None,
         pixel_values=None,
         bbox_targets=None,
-        mask_targets=None,
         class_ids=None,
         object_mask=None,
         masks=None,
@@ -653,27 +646,23 @@ class VLM(PreTrainedModel):
                 base_grounding = detection_output["bbox_loss"]
                 if base_grounding is None:
                     base_grounding = detection_output["grounding_loss"] * 0.0
-                detection_output["mask_loss"] = crop_mask_output["crop_mask_loss"]
-                detection_output["mask_bce_loss"] = crop_mask_output["crop_mask_bce_loss"]
-                detection_output["mask_dice_loss"] = crop_mask_output["crop_mask_dice_loss"]
                 detection_output["grounding_loss"] = (
                     self.bbox_loss_weight * base_grounding
-                    + self.mask_loss_weight * crop_mask_output["crop_mask_loss"]
+                    + self.crop_mask_loss_weight * crop_mask_output["crop_mask_loss"]
                 )
             output.update(detection_output)
             output["loss"] = detection_output["grounding_loss"] if weighted_text_loss is None else weighted_text_loss + detection_output["grounding_loss"]
-        elif bbox_targets is not None or mask_targets is not None:
+        elif bbox_targets is not None:
             seg_object_embeds = self.object_embeds_from_seg_tokens(
                 input_ids=input_ids,
                 decoder_hidden_states=decoder_outputs.hidden_states[-1],
                 image_seq_len=image_embeds.shape[1],
                 image_embeds=image_embeds,
-                target_slots=self._target_slot_count(bbox_targets, mask_targets),
+                target_slots=self._target_slot_count(bbox_targets),
             )
             detection_output = self.forward_grounding(
                 image_embeds=image_embeds,
                 bbox_targets=bbox_targets,
-                mask_targets=mask_targets,
                 object_mask=object_mask,
                 object_embeds=seg_object_embeds,
             )
@@ -761,22 +750,6 @@ class VLM(PreTrainedModel):
         bce_loss = torch.nan_to_num(bce_loss, nan=0.0, posinf=0.0, neginf=0.0)
         dice_loss = torch.nan_to_num(dice_loss, nan=0.0, posinf=0.0, neginf=0.0)
         return mask_loss, bce_loss, dice_loss
-
-    def bbox_focus_mask(self, bbox, info, device, margin=16):
-        focus = torch.zeros(self.height, self.width, dtype=torch.float32, device=device)
-        x1, y1, x2, y2 = [int(round(float(value))) for value in bbox]
-        x1 = max(0, min(int(info["resized_w"]), x1 - margin))
-        y1 = max(0, min(int(info["resized_h"]), y1 - margin))
-        x2 = max(0, min(int(info["resized_w"]), x2 + margin))
-        y2 = max(0, min(int(info["resized_h"]), y2 + margin))
-        if x2 <= x1:
-            x1 = max(0, x1 - margin)
-            x2 = min(int(info["resized_w"]), x1 + 2 * margin + 1)
-        if y2 <= y1:
-            y1 = max(0, y1 - margin)
-            y2 = min(int(info["resized_h"]), y1 + 2 * margin + 1)
-        focus[y1:y2, x1:x2] = 1.0
-        return focus
 
     def forward_crop_mask_grounding(self, pixel_values, masks, regions, object_embeds):
         full_batch = self._normalize_full_image_batch(pixel_values)
@@ -867,10 +840,7 @@ class VLM(PreTrainedModel):
 
         bbox_unit_preds = torch.sigmoid(self.bbox_head(object_embeds))
         bbox_preds = bbox_unit_preds * float(self.width)
-        mask_logits = image_embeds.new_zeros(batch_size, num_objects, self.height, self.width)
         bbox_targets = image_embeds.new_zeros(batch_size, num_objects, 4)
-        mask_targets = image_embeds.new_zeros(batch_size, num_objects, self.height, self.width)
-        mask_valid_targets = image_embeds.new_zeros(batch_size, num_objects, self.height, self.width)
         object_mask = torch.zeros(batch_size, num_objects, dtype=torch.bool, device=device)
 
         for batch_idx, batch_regions in enumerate(regions):
@@ -888,19 +858,10 @@ class VLM(PreTrainedModel):
 
                 bbox_target = self.bbox_to_encoder_frame(region["bbox"], info, device)
                 bbox_targets[batch_idx, obj_idx] = bbox_target
-                mask_targets[batch_idx, obj_idx] = self._resize_pad_mask(masks[batch_idx][mask_index], info, device)
-                mask_valid_targets[batch_idx, obj_idx] = self.bbox_focus_mask(bbox_target, info, device)
-                mask_logits[batch_idx, obj_idx] = self.decode_mask_from_patches(
-                    object_embed=object_embeds[batch_idx, obj_idx],
-                    image_embed=info["embeds"],
-                )
                 object_mask[batch_idx, obj_idx] = True
 
         grounding_loss = image_embeds.new_tensor(0.0)
         bbox_loss = None
-        mask_loss = None
-        mask_bce_loss = None
-        mask_dice_loss = None
         if object_mask.any():
             bbox_unit_targets = bbox_targets / float(self.width)
             bbox_loss = F.smooth_l1_loss(bbox_unit_preds[object_mask], bbox_unit_targets[object_mask], beta=0.05)
@@ -910,16 +871,10 @@ class VLM(PreTrainedModel):
 
         return {
             "bbox_preds": bbox_preds,
-            "mask_logits": mask_logits,
             "bbox_targets": bbox_targets,
-            "mask_targets": mask_targets,
-            "mask_valid_targets": mask_valid_targets,
             "object_mask": object_mask,
             "grounding_loss": grounding_loss,
             "bbox_loss": bbox_loss,
-            "mask_loss": mask_loss,
-            "mask_bce_loss": mask_bce_loss,
-            "mask_dice_loss": mask_dice_loss,
         }
 
     def select_image_info(self, infos, image_index=None, fallback_slot=0):
@@ -929,11 +884,9 @@ class VLM(PreTrainedModel):
                     return info
         return infos[min(fallback_slot, len(infos) - 1)]
 
-    def _target_slot_count(self, bbox_targets=None, mask_targets=None):
+    def _target_slot_count(self, bbox_targets=None):
         if bbox_targets is not None:
             return min(bbox_targets.shape[1], self.max_detection_slots)
-        if mask_targets is not None:
-            return min(mask_targets.shape[1], self.max_detection_slots)
         return self.max_detection_slots
 
     def object_embeds_from_seg_tokens(
@@ -981,7 +934,6 @@ class VLM(PreTrainedModel):
         self,
         image_embeds,
         bbox_targets=None,
-        mask_targets=None,
         object_mask=None,
         object_embeds=None,
         num_objects=None,
@@ -989,10 +941,9 @@ class VLM(PreTrainedModel):
         image_embeds = image_embeds.float()
         batch_size = image_embeds.shape[0]
         cls_embed = image_embeds[:, 0]
-        patch_embeds = image_embeds[:, 1:]
 
         if num_objects is None:
-            num_objects = self._target_slot_count(bbox_targets, mask_targets)
+            num_objects = self._target_slot_count(bbox_targets)
         num_objects = min(num_objects, self.max_detection_slots)
 
         if object_embeds is None:
@@ -1004,33 +955,8 @@ class VLM(PreTrainedModel):
         bbox_unit_preds = torch.sigmoid(self.bbox_head(object_embeds))
         bbox_preds = bbox_unit_preds * float(self.width)
 
-        patch_embeds = self.mask_patch_head(patch_embeds)
-        object_mask_embeds = self.mask_object_head(object_embeds)
-        patch_embeds = torch.nan_to_num(patch_embeds, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-        object_mask_embeds = torch.nan_to_num(object_mask_embeds, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-        patch_count = patch_embeds.shape[1]
-        grid_size = int(patch_count ** 0.5)
-        if grid_size * grid_size != patch_count:
-            raise ValueError(f"Expected square patch grid, got {patch_count} patches")
-
-        patch_grid = patch_embeds.reshape(batch_size, 1, grid_size, grid_size, -1)
-        object_grid = object_mask_embeds.reshape(batch_size, num_objects, 1, 1, -1)
-        conditioned = (patch_grid * object_grid).permute(0, 1, 4, 2, 3)
-        conditioned = conditioned.reshape(batch_size * num_objects, conditioned.shape[2], grid_size, grid_size)
-        mask_logits = self.mask_decoder(conditioned).reshape(batch_size, num_objects, grid_size, grid_size)
-        mask_logits = F.interpolate(
-            mask_logits,
-            size=(self.height, self.width),
-            mode="bilinear",
-            align_corners=False,
-        )
-        mask_logits = torch.nan_to_num(mask_logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
-
         grounding_loss = image_embeds.new_tensor(0.0)
         bbox_loss = None
-        mask_loss = None
-        mask_bce_loss = None
-        mask_dice_loss = None
 
         if object_mask is None:
             object_mask = torch.ones(batch_size, num_objects, dtype=torch.bool, device=image_embeds.device)
@@ -1044,23 +970,10 @@ class VLM(PreTrainedModel):
             bbox_loss = torch.nan_to_num(bbox_loss, nan=0.0, posinf=0.0, neginf=0.0)
             grounding_loss = grounding_loss + self.bbox_loss_weight * bbox_loss
 
-        if mask_targets is not None and object_mask.any():
-            mask_targets = mask_targets[:, :num_objects].to(image_embeds.device).float()
-            mask_loss, mask_bce_loss, mask_dice_loss = self.mask_criterion(
-                mask_logits[object_mask],
-                mask_targets[object_mask],
-            )
-            grounding_loss = grounding_loss + self.mask_loss_weight * mask_loss
-            grounding_loss = torch.nan_to_num(grounding_loss, nan=0.0, posinf=0.0, neginf=0.0)
-
         return {
             "bbox_preds": bbox_preds,
-            "mask_logits": mask_logits,
             "grounding_loss": grounding_loss,
             "bbox_loss": bbox_loss,
-            "mask_loss": mask_loss,
-            "mask_bce_loss": mask_bce_loss,
-            "mask_dice_loss": mask_dice_loss,
         }
 
 
