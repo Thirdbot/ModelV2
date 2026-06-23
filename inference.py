@@ -172,8 +172,8 @@ def tensor_to_pil(image: torch.Tensor) -> Image.Image:
 
 def render_mask_overlays(
     image_tensors: list[torch.Tensor],
-    mask_logits: torch.Tensor,
-    image_meta: list[dict[str, Any]],
+    crop_mask_logits: torch.Tensor,
+    crop_boxes: list[dict[str, Any]],
     global_bboxes: list[list[int]],
 ) -> list[str]:
     output_dir = Path(OUTPUT_DIR)
@@ -191,28 +191,24 @@ def render_mask_overlays(
     base_images = [tensor_to_pil(image).convert("RGBA") for image in image_tensors]
     overlays = [Image.new("RGBA", image.size, (0, 0, 0, 0)) for image in base_images]
 
-    mask_probs = mask_logits.detach().sigmoid().cpu()
-    for slot_idx, mask_prob in enumerate(mask_probs):
-        if not image_meta:
+    mask_probs = crop_mask_logits.detach().sigmoid().cpu()
+    for crop_idx, mask_prob in enumerate(mask_probs):
+        if crop_idx >= len(crop_boxes):
             continue
-        meta = image_meta[min(slot_idx, len(image_meta) - 1)]
+        meta = crop_boxes[crop_idx]
+        slot_idx = int(meta["slot_index"])
         image_index = int(meta["image_index"])
         if image_index >= len(overlays):
             continue
 
-        orig_w = int(meta["orig_w"])
-        orig_h = int(meta["orig_h"])
-        resized_w = int(meta["resized_w"])
-        resized_h = int(meta["resized_h"])
+        crop_left, crop_top, crop_right, crop_bottom = [int(value) for value in meta["crop_box"]]
+        crop_w = max(crop_right - crop_left, 1)
+        crop_h = max(crop_bottom - crop_top, 1)
         mask = (mask_prob > MASK_THRESHOLD).to(torch.uint8) * 255
-        mask_img = Image.fromarray(mask.numpy(), mode="L").crop((0, 0, resized_w, resized_h))
-        if resized_w == 0 or resized_h == 0:
-            continue
-
-        mask_img = mask_img.resize((orig_w, orig_h), resample=Image.Resampling.NEAREST)
+        mask_img = Image.fromarray(mask.numpy(), mode="L").resize((crop_w, crop_h), resample=Image.Resampling.NEAREST)
         color = colors[slot_idx % len(colors)]
         color_img = Image.new("RGBA", mask_img.size, color)
-        overlays[image_index].paste(color_img, (0, 0), mask_img)
+        overlays[image_index].paste(color_img, (crop_left, crop_top), mask_img)
 
     saved_paths = []
     for image_index, base in enumerate(base_images):
@@ -223,10 +219,10 @@ def render_mask_overlays(
 
         draw = ImageDraw.Draw(composed)
         for slot_idx, bbox in enumerate(global_bboxes):
-            if not image_meta:
+            matching_crop = next((item for item in crop_boxes if int(item["slot_index"]) == slot_idx), None)
+            if matching_crop is None:
                 continue
-            meta = image_meta[min(slot_idx, len(image_meta) - 1)]
-            if int(meta["image_index"]) != image_index:
+            if int(matching_crop["image_index"]) != image_index:
                 continue
             color = colors[slot_idx % len(colors)]
             draw.rectangle(bbox, outline=color[:3], width=2)
@@ -281,17 +277,24 @@ def run_inference() -> dict[str, Any]:
         grounding_image_indices=[grounding_image_indices],
     )
     local_bboxes = grounding["bbox_preds"][0].detach().cpu().tolist()
-    mask_logits = grounding["mask_logits"][0].detach().cpu()
     image_meta = grounding.get("image_meta", [[]])[0]
     global_bboxes = [
         encoder_bbox_to_global(bbox, image_meta[min(idx, len(image_meta) - 1)])
         for idx, bbox in enumerate(local_bboxes)
         if image_meta
     ]
+    crop_grounding = model.predict_crop_masks_from_bboxes(
+        pixel_values=[image_tensors],
+        global_bboxes=[global_bboxes],
+        image_indices=[grounding_image_indices[: len(global_bboxes)]],
+        object_embeds=grounding["object_embeds"],
+    )
+    crop_mask_logits = crop_grounding["crop_mask_logits"].detach().cpu()
+    crop_boxes = crop_grounding["crop_boxes"]
     rendered_paths = render_mask_overlays(
         image_tensors=image_tensors,
-        mask_logits=mask_logits,
-        image_meta=image_meta,
+        crop_mask_logits=crop_mask_logits,
+        crop_boxes=crop_boxes,
         global_bboxes=global_bboxes,
     )
 
@@ -303,6 +306,7 @@ def run_inference() -> dict[str, Any]:
         "global_bboxes": global_bboxes,
         "image_meta": image_meta,
         "grounding_image_indices": grounding_image_indices,
+        "crop_boxes": crop_boxes,
         "rendered_paths": rendered_paths,
         "target_answer": row.get("answer", ""),
         "target_evidence": row.get("evidence", ""),

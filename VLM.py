@@ -498,11 +498,77 @@ class VLM(PreTrainedModel):
             "bbox_preds": bbox_preds,
             "mask_logits": mask_logits,
             "image_meta": image_meta,
+            "object_embeds": object_embeds,
             "grounding_loss": None,
             "bbox_loss": None,
             "mask_loss": None,
             "mask_bce_loss": None,
             "mask_dice_loss": None,
+        }
+
+    @torch.no_grad()
+    def predict_crop_masks_from_bboxes(self, pixel_values, global_bboxes, image_indices, object_embeds):
+        full_batch = self._normalize_full_image_batch(pixel_values)
+        if full_batch is None:
+            raise ValueError("predict_crop_masks_from_bboxes expects full-image pixel_values as a list.")
+
+        device = object_embeds.device
+        crop_images = []
+        crop_boxes = []
+        crop_object_embeds = []
+
+        for batch_idx, batch_bboxes in enumerate(global_bboxes):
+            images = full_batch[batch_idx]
+            for obj_idx, bbox in enumerate(batch_bboxes):
+                if obj_idx >= object_embeds.shape[1]:
+                    continue
+                image_index = int(image_indices[batch_idx][obj_idx]) if image_indices is not None else 0
+                if image_index >= len(images):
+                    continue
+                image = images[image_index].to(device=device, dtype=torch.float32)
+                _, image_h, image_w = image.shape
+                crop_left, crop_top, crop_right, crop_bottom = self._crop_box_from_bbox(bbox, image_h, image_w)
+                image_crop = image[:, crop_top:crop_bottom, crop_left:crop_right]
+                image_crop = F.interpolate(
+                    image_crop.unsqueeze(0),
+                    size=(self.height, self.width),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0]
+                crop_images.append(image_crop)
+                crop_boxes.append(
+                    {
+                        "batch_index": batch_idx,
+                        "slot_index": obj_idx,
+                        "image_index": image_index,
+                        "crop_box": [crop_left, crop_top, crop_right, crop_bottom],
+                    }
+                )
+                crop_object_embeds.append(object_embeds[batch_idx, obj_idx])
+
+        if not crop_images:
+            return {
+                "crop_mask_logits": torch.empty(0, self.height, self.width, device=device),
+                "crop_boxes": crop_boxes,
+            }
+
+        crop_images = torch.stack(crop_images).to(device=device)
+        crop_object_embeds = torch.stack(crop_object_embeds).to(device=device)
+        crop_vision_out = self.encoder(pixel_values=crop_images).last_hidden_state
+        text_dtype = self.decoder.get_input_embeddings().weight.dtype
+        crop_image_embeds = self.bridge_adapter(crop_vision_out).to(dtype=text_dtype)
+
+        crop_logits = []
+        for crop_idx in range(crop_image_embeds.shape[0]):
+            crop_logits.append(
+                self.decode_mask_from_patches(
+                    object_embed=crop_object_embeds[crop_idx],
+                    image_embed=crop_image_embeds[crop_idx],
+                )
+            )
+        return {
+            "crop_mask_logits": torch.stack(crop_logits),
+            "crop_boxes": crop_boxes,
         }
 
     def forward(
