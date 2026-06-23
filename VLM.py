@@ -83,6 +83,7 @@ class VLM(PreTrainedModel):
             nn.GELU(),
             nn.Conv2d(mask_hidden_size // 2, 1, kernel_size=1),
         )
+        self._crop_margin_ratio = 0.75
 
         if verbose:
             print("initializing VLM")
@@ -172,6 +173,49 @@ class VLM(PreTrainedModel):
         padded = mask.new_zeros(self.height, self.width)
         padded[: int(info["resized_h"]), : int(info["resized_w"])] = resized
         return (padded > 0).float()
+
+    def _crop_box_from_bbox(self, bbox, image_h, image_w):
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        left = min(x1, x2)
+        right = max(x1, x2)
+        top = min(y1, y2)
+        bottom = max(y1, y2)
+        width = max(right - left, 1.0)
+        height = max(bottom - top, 1.0)
+        margin = max(width, height, 8.0) * self._crop_margin_ratio
+        cx = (left + right) * 0.5
+        cy = (top + bottom) * 0.5
+        crop_left = max(0, int(round(cx - width * 0.5 - margin)))
+        crop_top = max(0, int(round(cy - height * 0.5 - margin)))
+        crop_right = min(int(image_w), int(round(cx + width * 0.5 + margin)))
+        crop_bottom = min(int(image_h), int(round(cy + height * 0.5 + margin)))
+        if crop_right <= crop_left:
+            crop_right = min(int(image_w), crop_left + 1)
+        if crop_bottom <= crop_top:
+            crop_bottom = min(int(image_h), crop_top + 1)
+        return crop_left, crop_top, crop_right, crop_bottom
+
+    def _crop_resize_image_and_mask(self, image, mask, bbox, device):
+        image = image.to(device=device, dtype=torch.float32)
+        mask = mask.to(device=device, dtype=torch.float32)
+        if mask.ndim == 3:
+            mask = mask[0]
+        _, image_h, image_w = image.shape
+        crop_left, crop_top, crop_right, crop_bottom = self._crop_box_from_bbox(bbox, image_h, image_w)
+        image_crop = image[:, crop_top:crop_bottom, crop_left:crop_right]
+        mask_crop = mask[crop_top:crop_bottom, crop_left:crop_right]
+        image_crop = F.interpolate(
+            image_crop.unsqueeze(0),
+            size=(self.height, self.width),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+        mask_crop = F.interpolate(
+            mask_crop.unsqueeze(0).unsqueeze(0),
+            size=(self.height, self.width),
+            mode="nearest",
+        )[0, 0]
+        return image_crop, (mask_crop > 0).float()
 
     def build_full_image_prefix_inputs(self, pixel_values, input_ids, attention_mask=None, regions=None):
         full_batch = self._normalize_full_image_batch(pixel_values)
@@ -532,6 +576,24 @@ class VLM(PreTrainedModel):
                 regions=regions,
                 object_embeds=seg_object_embeds,
             )
+            crop_mask_output = self.forward_crop_mask_grounding(
+                pixel_values=pixel_values,
+                masks=masks,
+                regions=regions,
+                object_embeds=seg_object_embeds,
+            )
+            if crop_mask_output is not None:
+                detection_output.update(crop_mask_output)
+                base_grounding = detection_output["bbox_loss"]
+                if base_grounding is None:
+                    base_grounding = detection_output["grounding_loss"] * 0.0
+                detection_output["mask_loss"] = crop_mask_output["crop_mask_loss"]
+                detection_output["mask_bce_loss"] = crop_mask_output["crop_mask_bce_loss"]
+                detection_output["mask_dice_loss"] = crop_mask_output["crop_mask_dice_loss"]
+                detection_output["grounding_loss"] = (
+                    self.bbox_loss_weight * base_grounding
+                    + self.mask_loss_weight * crop_mask_output["crop_mask_loss"]
+                )
             output.update(detection_output)
             output["loss"] = detection_output["grounding_loss"] if weighted_text_loss is None else weighted_text_loss + detection_output["grounding_loss"]
         elif bbox_targets is not None or mask_targets is not None:
@@ -650,6 +712,77 @@ class VLM(PreTrainedModel):
         focus[y1:y2, x1:x2] = 1.0
         return focus
 
+    def forward_crop_mask_grounding(self, pixel_values, masks, regions, object_embeds):
+        full_batch = self._normalize_full_image_batch(pixel_values)
+        if full_batch is None:
+            return None
+
+        device = object_embeds.device
+        crop_images = []
+        crop_targets = []
+        crop_object_embeds = []
+        crop_owners = []
+
+        for batch_idx, batch_regions in enumerate(regions):
+            images = full_batch[batch_idx]
+            for obj_idx, region in enumerate(batch_regions[: self.max_detection_slots]):
+                image_index = int(region.get("image_index", 0))
+                mask_index = int(region.get("mask_index", region.get("region_index", 0)))
+                if image_index >= len(images) or mask_index >= len(masks[batch_idx]):
+                    continue
+                crop_image, crop_mask = self._crop_resize_image_and_mask(
+                    image=images[image_index],
+                    mask=masks[batch_idx][mask_index],
+                    bbox=region["bbox"],
+                    device=device,
+                )
+                crop_images.append(crop_image)
+                crop_targets.append(crop_mask)
+                crop_object_embeds.append(object_embeds[batch_idx, obj_idx])
+                crop_owners.append((batch_idx, obj_idx))
+
+        if not crop_images:
+            zero = object_embeds.sum() * 0.0
+            return {
+                "crop_mask_logits": None,
+                "crop_mask_targets": None,
+                "crop_mask_loss": zero,
+                "crop_mask_bce_loss": zero,
+                "crop_mask_dice_loss": zero,
+                "crop_owners": crop_owners,
+            }
+
+        crop_images = torch.stack(crop_images).to(device=device)
+        crop_targets = torch.stack(crop_targets).to(device=device)
+        crop_object_embeds = torch.stack(crop_object_embeds).to(device=device)
+        crop_vision_out = self.encoder(pixel_values=crop_images).last_hidden_state
+        text_dtype = self.decoder.get_input_embeddings().weight.dtype
+        crop_image_embeds = self.bridge_adapter(crop_vision_out).to(dtype=text_dtype)
+
+        crop_logits = []
+        for crop_idx in range(crop_image_embeds.shape[0]):
+            crop_logits.append(
+                self.decode_mask_from_patches(
+                    object_embed=crop_object_embeds[crop_idx],
+                    image_embed=crop_image_embeds[crop_idx],
+                )
+            )
+        crop_logits = torch.stack(crop_logits)
+        crop_valid = torch.ones_like(crop_targets)
+        crop_mask_loss, crop_bce_loss, crop_dice_loss = self.mask_criterion(
+            crop_logits,
+            crop_targets,
+            valid_mask=crop_valid,
+        )
+        return {
+            "crop_mask_logits": crop_logits,
+            "crop_mask_targets": crop_targets,
+            "crop_mask_loss": crop_mask_loss,
+            "crop_mask_bce_loss": crop_bce_loss,
+            "crop_mask_dice_loss": crop_dice_loss,
+            "crop_owners": crop_owners,
+        }
+
     def forward_full_image_grounding(self, image_embeds, masks, regions, object_embeds=None):
         if self._last_image_infos is None:
             raise ValueError("Full-image grounding requires image metadata.")
@@ -706,12 +839,7 @@ class VLM(PreTrainedModel):
             bbox_unit_targets = bbox_targets / float(self.width)
             bbox_loss = F.smooth_l1_loss(bbox_unit_preds[object_mask], bbox_unit_targets[object_mask], beta=0.05)
             bbox_loss = torch.nan_to_num(bbox_loss, nan=0.0, posinf=0.0, neginf=0.0)
-            mask_loss, mask_bce_loss, mask_dice_loss = self.mask_criterion(
-                mask_logits[object_mask],
-                mask_targets[object_mask],
-                valid_mask=mask_valid_targets[object_mask],
-            )
-            grounding_loss = self.bbox_loss_weight * bbox_loss + self.mask_loss_weight * mask_loss
+            grounding_loss = self.bbox_loss_weight * bbox_loss
             grounding_loss = torch.nan_to_num(grounding_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
