@@ -15,6 +15,7 @@ the grounding anchor for the bbox and mask heads.
 
 class VLM(PreTrainedModel):
     config_class = EncoderDecoderConfig
+    _keys_to_ignore_on_load_missing = [r"mask_refiner\..*"]
 
     def __init__(
         self,
@@ -28,6 +29,7 @@ class VLM(PreTrainedModel):
         text_loss_weight=1.0,
         bbox_loss_weight=1.0,
         crop_mask_loss_weight=1.0,
+        crop_margin_ratio=0.25,
         verbose=False,
     ):
         super().__init__(config)
@@ -39,6 +41,7 @@ class VLM(PreTrainedModel):
         self.text_loss_weight = text_loss_weight
         self.bbox_loss_weight = bbox_loss_weight
         self.crop_mask_loss_weight = crop_mask_loss_weight
+        self.crop_margin_ratio = crop_margin_ratio
         self._last_image_infos = None
 
         if decoder_name_or_path is None:
@@ -83,7 +86,13 @@ class VLM(PreTrainedModel):
             nn.GELU(),
             nn.Conv2d(mask_hidden_size // 2, 1, kernel_size=1),
         )
-        self._crop_margin_ratio = 0.75
+        self.mask_refiner = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
 
         if verbose:
             print("initializing VLM")
@@ -102,6 +111,7 @@ class VLM(PreTrainedModel):
         text_loss_weight=1.0,
         bbox_loss_weight=1.0,
         crop_mask_loss_weight=1.0,
+        crop_margin_ratio=0.25,
         verbose=False,
     ):
         encoder_config = AutoConfig.from_pretrained(encoder_name_or_path)
@@ -123,6 +133,7 @@ class VLM(PreTrainedModel):
             text_loss_weight=text_loss_weight,
             bbox_loss_weight=bbox_loss_weight,
             crop_mask_loss_weight=crop_mask_loss_weight,
+            crop_margin_ratio=crop_margin_ratio,
             verbose=verbose,
         )
 
@@ -182,7 +193,7 @@ class VLM(PreTrainedModel):
         bottom = max(y1, y2)
         width = max(right - left, 1.0)
         height = max(bottom - top, 1.0)
-        margin = max(width, height, 8.0) * self._crop_margin_ratio
+        margin = max(width, height, 8.0) * self.crop_margin_ratio
         cx = (left + right) * 0.5
         cy = (top + bottom) * 0.5
         crop_left = max(0, int(round(cx - width * 0.5 - margin)))
@@ -699,7 +710,9 @@ class VLM(PreTrainedModel):
             size=(self.height, self.width),
             mode="bilinear",
             align_corners=False,
-        )[0, 0]
+        )
+        mask_logits = mask_logits + self.mask_refiner(mask_logits)
+        mask_logits = mask_logits[0, 0]
         return torch.nan_to_num(mask_logits, nan=0.0, posinf=20.0, neginf=-20.0).clamp(min=-20.0, max=20.0)
 
     def mask_criterion(self, logits, targets, valid_mask=None):

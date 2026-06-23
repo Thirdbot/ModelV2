@@ -66,6 +66,7 @@ class TrainConfig:
     text_loss_weight: float = 1.0
     bbox_loss_weight: float = 1.0
     crop_mask_loss_weight: float = 1.0
+    crop_margin_ratio: float = 0.25
     include_empty_rows: bool = False
     max_train_samples: int | None = 1
     max_eval_samples: int | None = 1
@@ -119,6 +120,7 @@ def build_tokenizer_and_model(config: TrainConfig, special_tokens: list[str] | N
         text_loss_weight=config.text_loss_weight,
         bbox_loss_weight=config.bbox_loss_weight,
         crop_mask_loss_weight=config.crop_mask_loss_weight,
+        crop_margin_ratio=config.crop_margin_ratio,
     )
 
     if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
