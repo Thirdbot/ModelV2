@@ -41,7 +41,6 @@ def normalize_region(region: dict[str, Any]) -> dict[str, Any]:
         "object": str(region["object_type"]),
         "class_id": int(region["class_id"]),
         "color": str(region["class_color"]),
-        "bbox": [int(v) for v in region["bbox"]],
         "evidence": as_list(region.get("evidence", "")),
     }
 

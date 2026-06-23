@@ -35,14 +35,11 @@ def _region_evidence(region: dict[str, Any]) -> list[str]:
 
     obj = str(region.get("object", "region")).capitalize()
     color = region.get("color")
-    bbox = region.get("bbox")
     center = region.get("center")
 
     generated = []
-    if bbox is not None:
-        generated.append(f"{obj} occupies the area from x={bbox[0]} to {bbox[2]} and y={bbox[1]} to {bbox[3]}")
     if center is not None:
-        generated.append(f"{obj} sits near x={center[0]} and y={center[1]}")
+        generated.append(f"{obj} is visible near the interpreted region")
     if color:
         generated.append(f"{obj} is highlighted in {color}")
     return generated or [f"{obj} supports the answer"]
@@ -68,8 +65,6 @@ class GroundingVQAFormatter:
             parts.append(f"<color>{_xml_escape(region.get('color', ''))}</color>")
             for evidence in _region_evidence(region):
                 parts.append(f"<evidence>{_xml_escape(evidence)}</evidence>")
-            bbox = region["bbox"]
-            parts.append(f"<bbox>[{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]</bbox>")
             parts.append("<SEG>")
             parts.append("</region>")
 
@@ -109,8 +104,7 @@ class GroundingVQAFormatter:
             "Task: answer the seismic interpretation question and ground each visual evidence region.\n"
             f"{image_sizes}\n"
             "Use <region> blocks for grounded evidence, include <image_index> for the source image, "
-            "place one segmentation marker inside each grounded region, "
-            "and return all <bbox> coordinates in full-image coordinates.\n"
+            "and place one segmentation marker inside each grounded region.\n"
             f"{prompt}"
         )
         return prompt_content

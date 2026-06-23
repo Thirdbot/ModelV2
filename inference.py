@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 from datasets import load_dataset
-from PIL import Image, ImageDraw
+from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoProcessor
 
@@ -52,8 +52,6 @@ SPECIAL_TOKENS = [
     "</color>",
     "<evidence>",
     "</evidence>",
-    "<bbox>",
-    "</bbox>",
     "<think>",
     "</think>",
     "<answer>",
@@ -104,52 +102,17 @@ def load_model_and_tokenizer(config: TrainConfig) -> tuple[VLM, Any]:
 
     if checkpoint is not None:
         state_dict = load_file(str(checkpoint / "model.safetensors"))
-        state_dict, skipped = filter_loadable_state_dict(model, state_dict)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if skipped:
-            print(f"Skipped incompatible checkpoint keys: {len(skipped)}")
-        if missing:
-            print(f"Missing checkpoint keys: {len(missing)}")
-        if unexpected:
-            print(f"Unexpected checkpoint keys: {len(unexpected)}")
+        model.load_state_dict(state_dict, strict=True)
 
     model.to(DEVICE)
     model.eval()
     return model, tokenizer
 
 
-def filter_loadable_state_dict(model: VLM, state_dict: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], list[str]]:
-    model_state = model.state_dict()
-    loadable = {}
-    skipped = []
-    for key, value in state_dict.items():
-        if key not in model_state or model_state[key].shape != value.shape:
-            skipped.append(key)
-            continue
-        loadable[key] = value
-    return loadable, skipped
-
-
 def build_prompt(tokenizer: Any, row: dict[str, Any], image_tensors: list[torch.Tensor]) -> str:
     formatter = GroundingVQAFormatter(tokenizer=tokenizer, image_token="<image>")
     question = row.get("question") or "Find and describe the seismic evidence."
     return formatter.build_prompt(prompt=question, images=image_tensors)
-
-
-def encoder_bbox_to_global(local_bbox: list[float], image_meta: dict[str, Any]) -> list[int]:
-    orig_w = int(image_meta["orig_w"])
-    orig_h = int(image_meta["orig_h"])
-    scale = float(image_meta["scale"])
-    x1 = max(0, min(orig_w, round(local_bbox[0] / scale)))
-    y1 = max(0, min(orig_h, round(local_bbox[1] / scale)))
-    x2 = max(0, min(orig_w, round(local_bbox[2] / scale)))
-    y2 = max(0, min(orig_h, round(local_bbox[3] / scale)))
-    return [
-        min(x1, x2),
-        min(y1, y2),
-        max(x1, x2),
-        max(y1, y2),
-    ]
 
 
 def parse_grounding_image_indices(text: str, max_objects: int, default_index: int = 0) -> list[int]:
@@ -172,9 +135,8 @@ def tensor_to_pil(image: torch.Tensor) -> Image.Image:
 
 def render_mask_overlays(
     image_tensors: list[torch.Tensor],
-    crop_mask_logits: torch.Tensor,
-    crop_boxes: list[dict[str, Any]],
-    global_bboxes: list[list[int]],
+    mask_logits: torch.Tensor,
+    image_meta: list[dict[str, Any]],
 ) -> list[str]:
     output_dir = Path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -191,24 +153,25 @@ def render_mask_overlays(
     base_images = [tensor_to_pil(image).convert("RGBA") for image in image_tensors]
     overlays = [Image.new("RGBA", image.size, (0, 0, 0, 0)) for image in base_images]
 
-    mask_probs = crop_mask_logits.detach().sigmoid().cpu()
-    for crop_idx, mask_prob in enumerate(mask_probs):
-        if crop_idx >= len(crop_boxes):
+    mask_probs = mask_logits.detach().sigmoid().cpu()
+    for slot_idx, mask_prob in enumerate(mask_probs):
+        if slot_idx >= len(image_meta):
             continue
-        meta = crop_boxes[crop_idx]
-        slot_idx = int(meta["slot_index"])
+        meta = image_meta[slot_idx]
         image_index = int(meta["image_index"])
         if image_index >= len(overlays):
             continue
 
-        crop_left, crop_top, crop_right, crop_bottom = [int(value) for value in meta["crop_box"]]
-        crop_w = max(crop_right - crop_left, 1)
-        crop_h = max(crop_bottom - crop_top, 1)
+        resized_w = int(meta["resized_w"])
+        resized_h = int(meta["resized_h"])
+        orig_w = int(meta["orig_w"])
+        orig_h = int(meta["orig_h"])
+        mask_prob = mask_prob[:resized_h, :resized_w]
         mask = (mask_prob > MASK_THRESHOLD).to(torch.uint8) * 255
-        mask_img = Image.fromarray(mask.numpy(), mode="L").resize((crop_w, crop_h), resample=Image.Resampling.NEAREST)
+        mask_img = Image.fromarray(mask.numpy(), mode="L").resize((orig_w, orig_h), resample=Image.Resampling.NEAREST)
         color = colors[slot_idx % len(colors)]
         color_img = Image.new("RGBA", mask_img.size, color)
-        overlays[image_index].paste(color_img, (crop_left, crop_top), mask_img)
+        overlays[image_index].paste(color_img, (0, 0), mask_img)
 
     saved_paths = []
     for image_index, base in enumerate(base_images):
@@ -216,18 +179,6 @@ def render_mask_overlays(
         overlay_path = output_dir / f"test_{TEST_INDEX}_image_{image_index}_overlay.png"
         base.convert("RGB").save(original_path)
         composed = Image.alpha_composite(base, overlays[image_index])
-
-        draw = ImageDraw.Draw(composed)
-        for slot_idx, bbox in enumerate(global_bboxes):
-            matching_crop = next((item for item in crop_boxes if int(item["slot_index"]) == slot_idx), None)
-            if matching_crop is None:
-                continue
-            if int(matching_crop["image_index"]) != image_index:
-                continue
-            color = colors[slot_idx % len(colors)]
-            draw.rectangle(bbox, outline=color[:3], width=2)
-            draw.text((bbox[0], max(0, bbox[1] - 12)), f"slot {slot_idx}", fill=color[:3])
-
         composed.convert("RGB").save(overlay_path)
         saved_paths.extend([str(original_path), str(overlay_path)])
     return saved_paths
@@ -276,37 +227,20 @@ def run_inference() -> dict[str, Any]:
         attention_mask=grounding_tokens["attention_mask"],
         grounding_image_indices=[grounding_image_indices],
     )
-    local_bboxes = grounding["bbox_preds"][0].detach().cpu().tolist()
     image_meta = grounding.get("image_meta", [[]])[0]
-    global_bboxes = [
-        encoder_bbox_to_global(bbox, image_meta[min(idx, len(image_meta) - 1)])
-        for idx, bbox in enumerate(local_bboxes)
-        if image_meta
-    ]
-    crop_grounding = model.predict_crop_masks_from_bboxes(
-        pixel_values=[image_tensors],
-        global_bboxes=[global_bboxes],
-        image_indices=[grounding_image_indices[: len(global_bboxes)]],
-        object_embeds=grounding["object_embeds"],
-    )
-    crop_mask_logits = crop_grounding["crop_mask_logits"].detach().cpu()
-    crop_boxes = crop_grounding["crop_boxes"]
+    mask_logits = grounding["mask_logits"][0].detach().cpu()
     rendered_paths = render_mask_overlays(
         image_tensors=image_tensors,
-        crop_mask_logits=crop_mask_logits,
-        crop_boxes=crop_boxes,
-        global_bboxes=global_bboxes,
+        mask_logits=mask_logits,
+        image_meta=image_meta,
     )
 
     result = {
         "test_index": TEST_INDEX,
         "question": row.get("question", ""),
         "generated_text": generated_text,
-        "encoder_frame_bboxes": local_bboxes,
-        "global_bboxes": global_bboxes,
         "image_meta": image_meta,
         "grounding_image_indices": grounding_image_indices,
-        "crop_boxes": crop_boxes,
         "rendered_paths": rendered_paths,
         "target_answer": row.get("answer", ""),
         "target_evidence": row.get("evidence", ""),
@@ -319,8 +253,6 @@ result = run_inference()
 print("\n--- test split full multimodal inference ---")
 print(f"test_index: {result['test_index']}")
 print(result["generated_text"])
-if result["global_bboxes"]:
-    print("first_global_bbox_from_head:", result["global_bboxes"][0])
 if result["rendered_paths"]:
     print("rendered_images:")
     for path in result["rendered_paths"]:
