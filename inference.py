@@ -10,7 +10,8 @@ class InferenceLang:
         self.max_seq = max_seq
         self.load_in4_bit = load_in_4bit
 
-        self.model, self.processor = VLM(stage2_model).load_unsloth_vlm()  # for native model, in future use from_config for custom model
+        self.model, self.processor = VLM(model_path).load_unsloth_vlm()  # for native model, in future use from_config for custom model
+        self.processor.image_processor.do_image_splitting = False
 
         # self.model = self.model.merge_and_unload()
 
@@ -45,8 +46,9 @@ class InferenceLang:
             return_tensors="pt"
         ).to("cuda")
 
-        outputs = self.model.generate(**inputs, max_new_tokens=self.max_seq)
-        response = self.processor.decode(outputs[0])
+        outputs = self.model.generate(**inputs, max_new_tokens=self.max_seq,do_sample=False)
+        response = outputs[0][inputs["input_ids"][0].shape[-1]:]
+        response = self.processor.decode(response,skip_special_tokens=False)
         print(response)
 
 

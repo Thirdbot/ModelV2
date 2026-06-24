@@ -1,6 +1,6 @@
 import json
 import re
-from datasets import load_dataset
+from datasets import load_dataset,Dataset
 
 """
 3 stages of training that come from 3 format of dataset
@@ -10,7 +10,7 @@ from datasets import load_dataset
 """
 
 def extract_regions(text):
-    return re.findall(r"<region>(.*?)</region>",text,flags=re.DOTALL)
+    return re.findall(r"<region>.*?</region>",text,flags=re.DOTALL)
 
 def qea_process(example):
     """
@@ -25,20 +25,20 @@ def qea_process(example):
     regions = json.loads(regions)
     evidence_str = example['evidence']
     # map image and region together
-    info = {}
+    info = []
 
-    user = {
-        "role": "user",
-        "content": [],
-    }
-    assistant = {
-        "role": "assistant",
-        "content": [],
-    }
+
 
     for data in regions:
         conversations = []
-
+        user = {
+            "role": "user",
+            "content": [],
+        }
+        assistant = {
+            "role": "assistant",
+            "content": [],
+        }
         region_idx = data['region_idx']
         evidence = extract_regions(evidence_str)
         if evidence and len(evidence) > region_idx:
@@ -56,7 +56,7 @@ def qea_process(example):
         conversations.append(user)
         conversations.append(assistant)
 
-        info.update({
+        info.append({
             "message":conversations,
         })
 
@@ -76,19 +76,20 @@ def ie_process(example):
     regions = json.loads(regions)
     evidence_str = example['evidence']
     # map image and region together
-    info = {}
+    info = []
 
-    user = {
-        "role": "user",
-        "content": [],
-    }
-    assistant = {
-        "role": "assistant",
-        "content": [],
-    }
+
 
     for data in regions:
         conversations = []
+        user = {
+            "role": "user",
+            "content": [],
+        }
+        assistant = {
+            "role": "assistant",
+            "content": [],
+        }
         # map index individual
         image_idx = data['image_idx']
         mask_idx = data['mask_idx']
@@ -101,6 +102,7 @@ def ie_process(example):
             evidence_per_region = ""
 
         # user question. it is the same question for multiple image in sample the answer will be by image evidence
+
         user['content'] = [
             {"type": "image"},{"type": "text","text": instruction+question}
         ]
@@ -110,12 +112,11 @@ def ie_process(example):
         conversations.append(user)
         conversations.append(assistant)
 
-        info.update({
+        info.append({
             "i":images[image_idx],
             "m":masks[mask_idx],
             "message":conversations,
         })
-
     return info
 
 
@@ -180,23 +181,24 @@ class VisionCollator:
 
     def __call__(self, example):
         image = [ensure_image_list(image['i']) for image in example] # each key contains image so it is list of list
+        messages = [clean_messages(text['message']) for text in example]
         texts = [self.tokenizer.apply_chat_template(
-            text['message'],tokenize=False,add_generation_prompt=False
-        ) for text in example]
+            message,tokenize=False,add_generation_prompt=False
+        ) for message in messages]
+        prompt_texts = [self.tokenizer.apply_chat_template(
+            message[:1],tokenize=False,add_generation_prompt=True
+        ) for message in messages]
 
         # mask =[mask['m'] for mask in example]
 
         batch = self.processor(text=texts, images=image, padding=True
                                ,return_tensors="pt")
 
-        labels = batch['input_ids'].clone()
-
-        assistant_id = find_assistant_label(tokenizer=self.tokenizer)
-        indices = (labels == assistant_id).nonzero(as_tuple=True)[0]
-        if len(indices) > 0:
-            labels[:indices] = -100
-        labels[labels == self.tokenizer.pad_token_id] = -100 # padded don't need to be learned
-        batch['labels'] = labels # what it is going to learn
+        batch['labels'] = build_labels(
+            tokenizer=self.tokenizer,
+            input_ids=batch['input_ids'],
+            prompt_texts=prompt_texts,
+        )
         return batch
 
 class LangCollator:
@@ -206,22 +208,23 @@ class LangCollator:
 
     def __call__(self, example):
 
+        messages = [clean_messages(text['message']) for text in example]
         texts = [self.tokenizer.apply_chat_template(
-            text['message'], tokenize=False, add_generation_prompt=False
-        ) for text in example]
+            message, tokenize=False, add_generation_prompt=False
+        ) for message in messages]
+        prompt_texts = [self.tokenizer.apply_chat_template(
+            message[:1], tokenize=False, add_generation_prompt=True
+        ) for message in messages]
 
 
         batch = self.processor(text=texts, padding=True
                                , return_tensors="pt")
 
-        labels = batch['input_ids'].clone()
-
-        assistant_id = find_assistant_label(tokenizer=self.tokenizer)
-        indices = (labels == assistant_id).nonzero(as_tuple=True)[0]
-        if len(indices) > 0:
-            labels[:indices] = -100
-        labels[labels == self.tokenizer.pad_token_id] = -100  # padded don't need to be learned
-        batch['labels'] = labels  # what it is going to learn
+        batch['labels'] = build_labels(
+            tokenizer=self.tokenizer,
+            input_ids=batch['input_ids'],
+            prompt_texts=prompt_texts,
+        )
         return batch
 
 
@@ -230,10 +233,31 @@ def ensure_image_list(value):
         return value
     return [value]
 
-def find_assistant_label(tokenizer):
-    assistant_token = tokenizer.apply_chat_template([[]],tokenize=False,add_generation_prompt=True)
-    assistant_id = tokenizer.convert_tokens_to_ids(assistant_token[0])
-    return assistant_id
+def clean_messages(messages):
+    cleaned = []
+    for message in messages:
+        content = []
+        for item in message["content"]:
+            if item["type"] == "image":
+                content.append({"type": "image"})
+            elif item["type"] == "text":
+                content.append({"type": "text", "text": item.get("text") or ""})
+        cleaned.append({"role": message["role"], "content": content})
+    return cleaned
+
+def build_labels(tokenizer, input_ids, prompt_texts):
+    labels = input_ids.clone()
+    prompt_inputs = tokenizer(
+        prompt_texts,
+        padding=False,
+        add_special_tokens=False,
+    )
+
+    for row_idx, prompt_ids in enumerate(prompt_inputs["input_ids"]):
+        labels[row_idx, :len(prompt_ids)] = -100
+
+    labels[labels == tokenizer.pad_token_id] = -100
+    return labels
 
 class TemplateDataset:
     def __init__(self,dataset,test_ratio=0.2,map_fn=None):
@@ -241,8 +265,14 @@ class TemplateDataset:
         self.ds = load_dataset(self.dataset_repo)
         self.usable = self.ds['train']
         if map_fn is not None:
-            self.temped_dataset = self.usable.map(map_fn, batched=False
-                                              , remove_columns=self.usable.column_names)
+            rows = []
+            for example in self.usable:
+                processed = map_fn(example)
+                if isinstance(processed, list):
+                    rows.extend(processed)
+                else:
+                    rows.append(processed)
+            self.temped_dataset = Dataset.from_list(rows)
         else:
             self.temped_dataset = self.usable
         hold = self.temped_dataset.train_test_split(test_size=test_ratio)

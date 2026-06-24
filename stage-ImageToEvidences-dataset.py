@@ -9,6 +9,8 @@ if __name__ == '__main__':
     from transformers import EarlyStoppingCallback
 
     ie = TemplateDataset("thirdExec/synthetic-seismic-vlm",map_fn=ie_process)
+    print("dataset size: ",len(ie.temped_dataset))
+    print("example: \n\t",ie.temped_dataset[0:2])
 
     model,processor = VLM("HuggingFaceTB/SmolVLM-500M-Instruct").load_unsloth_vlm(use_gradient_checkpointing="unsloth",load_in_4bit=True)
 
@@ -32,7 +34,7 @@ if __name__ == '__main__':
             "skip_prepare_dataset": True,  # already prepared for collate
         },
         remove_unused_columns=False,
-        num_train_epochs=1000,
+        num_train_epochs=100,
         eval_strategy='epoch',
         learning_rate=2e-5,
         load_best_model_at_end=True,
@@ -60,7 +62,7 @@ if __name__ == '__main__':
         eval_dataset=ie.eval_dataset,
         callbacks=[early_stopping_callback]
     )
-    trainer.train(resume_from_checkpoint = True)
+    trainer.train(resume_from_checkpoint = False)
     model.save_pretrained("./trained-image-evidences")
     processor.tokenizer.save_pretrained("./trained-image-evidences")
     processor.save_pretrained("./trained-image-evidences")

@@ -14,12 +14,12 @@ training_args = SFTConfig(
         "skip_prepare_dataset": True, # already prepared for collate
     },
     remove_unused_columns=False,
-    num_train_epochs=1,
+    num_train_epochs=100,
     eval_strategy='epoch',
     learning_rate=2e-5,
     load_best_model_at_end=True,
     metric_for_best_model='eval_loss',
-
+    greater_is_better=False
 )
 
 
@@ -37,6 +37,7 @@ if __name__ == '__main__':
     # Quantized for smaller size vlm
     model, processor = VLM(stage2_model).load_unsloth_vlm(use_gradient_checkpointing="unsloth",
                                                                                    load_in_4bit=True) # for native model, in future use from_config for custom model
+    model = model.merge_and_unload()
 
     # not using this in the future ,but it is proof of concept for changing training procedure
     processor.image_processor.do_image_splitting = False # natively the processor is split image, but we are passing it different size anyway
@@ -48,6 +49,9 @@ if __name__ == '__main__':
 
     # for ncs model this could be just resize the input of ncs rather than tiling it
     dataset = TemplateDataset("thirdExec/synthetic-seismic-vlm",map_fn=preprocess_fn)
+    print("dataset size: ",len(dataset.temped_dataset))
+    print("example: \n\t",dataset.temped_dataset[0:2])
+
     collator = VisionCollator(processor=processor)
     model = FastVisionModel.get_peft_model(
         model,
@@ -66,9 +70,8 @@ if __name__ == '__main__':
         data_collator=collator,
         eval_dataset=dataset.eval_dataset,
         callbacks=[early_stopping_callback]
-
     )
-    trainer.train(resume_from_checkpoint = True)
+    trainer.train(resume_from_checkpoint = False)
     model.save_pretrained("./output")
     processor.tokenizer.save_pretrained("./output")
     processor.save_pretrained("./output")

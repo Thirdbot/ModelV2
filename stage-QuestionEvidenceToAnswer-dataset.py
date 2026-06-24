@@ -13,6 +13,8 @@ if __name__ == '__main__':
 
 
     ie = TemplateDataset("thirdExec/synthetic-seismic-vlm",map_fn=qea_process)
+    print("dataset size: ",len(ie.temped_dataset))
+    print("example: \n\t",ie.temped_dataset[0:2])
 
     model,processor = VLM(stage1_model).load_unsloth_vlm(use_gradient_checkpointing="unsloth",load_in_4bit=True)
 
@@ -35,7 +37,7 @@ if __name__ == '__main__':
             "skip_prepare_dataset": True,  # already prepared for collate
         },
         remove_unused_columns=False,
-        num_train_epochs=1000,
+        num_train_epochs=100,
         eval_strategy='epoch',
         learning_rate=2e-5,
         save_total_limit=2,
