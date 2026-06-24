@@ -1009,6 +1009,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "datasets" },
     { name = "nvidia-cudnn-cu11" },
+    { name = "trl" },
     { name = "unsloth" },
     { name = "wandb" },
 ]
@@ -1017,6 +1018,7 @@ dependencies = [
 requires-dist = [
     { name = "datasets", specifier = ">=4.3.0" },
     { name = "nvidia-cudnn-cu11", specifier = ">=9.10.2.21" },
+    { name = "trl", specifier = "==0.21.0" },
     { name = "unsloth", specifier = ">=2026.6.8" },
     { name = "wandb", specifier = ">=0.27.2" },
 ]
@@ -2617,16 +2619,16 @@ wheels = [
 
 [[package]]
 name = "trl"
-version = "0.24.0"
+version = "0.21.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/2e/30ece0055eee5763126e2d52f6e04aec294bcae34b46d9ca16c53c4b5852/trl-0.24.0.tar.gz", hash = "sha256:eee495223725d3da0596be2607581969db89ba0f7c00b075802addc31e61eac9", size = 368447, upload-time = "2025-10-16T00:10:37.65Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/bd/f25e4358287d3feabb815106edea902c93b85331beafeca358e28e23ba3a/trl-0.21.0.tar.gz", hash = "sha256:84dec571e47520e64ccedda94623df13e723fbbd689fd80bf524b9eb0b6d6ca8", size = 462967, upload-time = "2025-08-05T16:51:08.342Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/87/5f/c647fedde9d59ae35ee189cc49e419da5ac1d9ad9933cb69401a7eac4705/trl-0.24.0-py3-none-any.whl", hash = "sha256:a9145b7d4a4a33778de117bda48530f0cf5b2ac25acc07db80ad04836f490dfc", size = 423143, upload-time = "2025-10-16T00:10:35.809Z" },
+    { url = "https://files.pythonhosted.org/packages/59/bf/423e0c0b013d33ccbff8ea31ce97ee8211b72ebace1a205ae92dcb67682a/trl-0.21.0-py3-none-any.whl", hash = "sha256:0ac51a49290eb3a188dc187da5bbc95d9edc61395b4a3b4702337dd0cd890e0d", size = 511944, upload-time = "2025-08-05T16:51:07.128Z" },
 ]
 
 [[package]]

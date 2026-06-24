@@ -3,6 +3,10 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/output" />
+      <excludeFolder url="file://$MODULE_DIR$/trained-image-evidences" />
+      <excludeFolder url="file://$MODULE_DIR$/trained-question-evidences-answer" />
+      <excludeFolder url="file://$MODULE_DIR$/unsloth_compiled_cache" />
     </content>
     <orderEntry type="jdk" jdkName="uv (ModelV2)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
