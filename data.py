@@ -4,8 +4,8 @@ from datasets import load_dataset,Dataset
 
 """
 3 stages of training that come from 3 format of dataset
-1. 1 Image+Instruction+Question -> Evidences (ie_process)
-2. 1 Image(frozen)+Question + Evidences as instruction -> Answers (qea_process)
+1. 1 Image -> Evidences (ie_process)
+2. 1 Image(frozen) + Question + Evidences as instruction -> Answers (qea_process). After answer is included in fist stage, maybe this is no need to train
 3. Images + Question -> Evidences + Answers (preprocess_fn)
 """
 
@@ -21,44 +21,31 @@ def qea_process(example):
     question = example['question']
     answer = example['answer']
     reason = example['reason']
-    regions = example['regions']
-    regions = json.loads(regions)
     evidence_str = example['evidence']
     # map image and region together
     info = []
 
 
 
-    for data in regions:
-        conversations = []
-        user = {
-            "role": "user",
-            "content": [],
-        }
-        assistant = {
-            "role": "assistant",
-            "content": [],
-        }
-        region_idx = data['region_idx']
-        evidence = extract_regions(evidence_str)
-        if evidence and len(evidence) > region_idx:
-            evidence_per_region = evidence[region_idx]
-        else:
-            evidence_per_region = ""
+    user = {
+        "role": "user",
+        "content": [
+        {"type": "text","text":evidence_str+question}],
+    }
 
-        # user question. it is the same question for multiple image in sample the answer will be by image evidence
-        user['content'] = [
-            {"type": "text","text":evidence_per_region+question}
-        ]
-        # evidence as answer
-        assistant['content'] = [{"type": "text", "text": reason+answer}]
+    assistant = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": reason+answer}],
+    }
 
-        conversations.append(user)
-        conversations.append(assistant)
+    # The problem is evidence is pulling unrelated evidences for some it is helping in global and local and for some it is out of topic # fix this in relation object in dataset generator asap!!!
+    # suggestion for dataset 1.pull only what question and answer agreed to use 2. no matter if it globally included, if question and answer need it then use
+    # 3. for complex comparing question from dataset if llm be able to get evidence for that then it is win-win for this method
 
-        info.append({
-            "message":conversations,
-        })
+
+    info.append({
+        "message":[user,assistant],
+    })
 
     return info
 
@@ -69,12 +56,15 @@ def ie_process(example):
     :return:
     """
     images = example['images']
-    instruction = example['instruction']
-    question = example['question']
     masks = example['masks']
     regions = example['regions']
     regions = json.loads(regions)
     evidence_str = example['evidence']
+
+    stage1_instruction = (
+        "Identify the seismic feature in the image and output one grounded "
+        "<region>...</region> block with object, class_id, color, evidence, bbox, and <SEG>."
+    )
     # map image and region together
     info = []
 
@@ -101,10 +91,10 @@ def ie_process(example):
         else:
             evidence_per_region = ""
 
-        # user question. it is the same question for multiple image in sample the answer will be by image evidence
+        # this will be broad low level evidence-image mapping since question and answer can mislead 1-Many problem.
 
         user['content'] = [
-            {"type": "image"},{"type": "text","text": instruction+question}
+            {"type": "image"},{"type": "text","text": stage1_instruction}
         ]
         # evidence as answer
         assistant['content'] = [{"type": "text", "text": evidence_per_region}]
@@ -193,11 +183,13 @@ class VisionCollator:
 
         batch = self.processor(text=texts, images=image, padding=True
                                ,return_tensors="pt")
+        prompt_batch = self.processor(text=prompt_texts, images=image, padding=True
+                                      ,return_tensors="pt")
 
         batch['labels'] = build_labels(
-            tokenizer=self.tokenizer,
             input_ids=batch['input_ids'],
-            prompt_texts=prompt_texts,
+            prompt_attention_mask=prompt_batch['attention_mask'],
+            pad_token_id=self.tokenizer.pad_token_id,
         )
         return batch
 
@@ -219,11 +211,13 @@ class LangCollator:
 
         batch = self.processor(text=texts, padding=True
                                , return_tensors="pt")
+        prompt_batch = self.processor(text=prompt_texts, padding=True
+                                      , return_tensors="pt")
 
         batch['labels'] = build_labels(
-            tokenizer=self.tokenizer,
             input_ids=batch['input_ids'],
-            prompt_texts=prompt_texts,
+            prompt_attention_mask=prompt_batch['attention_mask'],
+            pad_token_id=self.tokenizer.pad_token_id,
         )
         return batch
 
@@ -245,18 +239,14 @@ def clean_messages(messages):
         cleaned.append({"role": message["role"], "content": content})
     return cleaned
 
-def build_labels(tokenizer, input_ids, prompt_texts):
+def build_labels(input_ids, prompt_attention_mask, pad_token_id):
     labels = input_ids.clone()
-    prompt_inputs = tokenizer(
-        prompt_texts,
-        padding=False,
-        add_special_tokens=False,
-    )
+    prompt_lens = prompt_attention_mask.sum(dim=1)
 
-    for row_idx, prompt_ids in enumerate(prompt_inputs["input_ids"]):
-        labels[row_idx, :len(prompt_ids)] = -100
+    for row_idx, prompt_len in enumerate(prompt_lens):
+        labels[row_idx, :prompt_len] = -100
 
-    labels[labels == tokenizer.pad_token_id] = -100
+    labels[labels == pad_token_id] = -100
     return labels
 
 class TemplateDataset:

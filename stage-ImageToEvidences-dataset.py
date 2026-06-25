@@ -1,5 +1,5 @@
 from VLM import VLM
-
+from callback import PrintOnPredictTextCallback
 from data import TemplateDataset,ie_process
 
 if __name__ == '__main__':
@@ -23,7 +23,7 @@ if __name__ == '__main__':
 
     training_args = SFTConfig(
         output_dir="./trained-image-evidences",
-        max_length=512,
+        max_length=1024,
         save_steps=1000,
         save_total_limit=2,
         save_strategy='epoch',
@@ -34,7 +34,7 @@ if __name__ == '__main__':
             "skip_prepare_dataset": True,  # already prepared for collate
         },
         remove_unused_columns=False,
-        num_train_epochs=100,
+        num_train_epochs=40,
         eval_strategy='epoch',
         learning_rate=2e-5,
         load_best_model_at_end=True,
@@ -62,7 +62,10 @@ if __name__ == '__main__':
         eval_dataset=ie.eval_dataset,
         callbacks=[early_stopping_callback]
     )
-    trainer.train(resume_from_checkpoint = False)
-    model.save_pretrained("./trained-image-evidences")
-    processor.tokenizer.save_pretrained("./trained-image-evidences")
-    processor.save_pretrained("./trained-image-evidences")
+    log_callback = PrintOnPredictTextCallback(trainer=trainer, processor=processor, num_samples=1)
+    trainer.add_callback(log_callback)
+    trainer.train(resume_from_checkpoint = True)
+    model = model.merge_and_unload()
+    model.save_pretrained("./trained-image-evidences/fw")
+    processor.tokenizer.save_pretrained("./trained-image-evidences/fw")
+    processor.save_pretrained("./trained-image-evidences/fw")

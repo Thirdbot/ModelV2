@@ -9,7 +9,7 @@ if __name__ == '__main__':
 
     root= Path(__file__).parent
 
-    stage1_model = (root / "trained-image-evidences").as_posix()
+    stage1_model = (root / "trained-image-evidences/fw").as_posix()
 
 
     ie = TemplateDataset("thirdExec/synthetic-seismic-vlm",map_fn=qea_process)
@@ -27,7 +27,7 @@ if __name__ == '__main__':
 
     training_args = SFTConfig(
         output_dir="./trained-question-evidences-answer",
-        max_length=512,
+        max_length=1024,
         save_steps=1000,
         save_strategy='epoch',
         fp16=False,
@@ -49,8 +49,6 @@ if __name__ == '__main__':
 
     collator = LangCollator(processor=processor) # language only
 
-    # load state from stage 1
-    model = model.merge_and_unload()
 
     model = FastVisionModel.get_peft_model(
         model,
@@ -72,6 +70,7 @@ if __name__ == '__main__':
 
     )
     trainer.train(resume_from_checkpoint = False)
-    model.save_pretrained("./trained-question-evidences-answer")
-    processor.tokenizer.save_pretrained("./trained-question-evidences-answer")
-    processor.save_pretrained("./trained-question-evidences-answer")
+    model = model.merge_and_unload()
+    model.save_pretrained("./trained-question-evidences-answer/fw")
+    processor.tokenizer.save_pretrained("./trained-question-evidences-answer/fw")
+    processor.save_pretrained("./trained-question-evidences-answer/fw")

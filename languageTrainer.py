@@ -3,7 +3,7 @@ from trl import SFTConfig, SFTTrainer
 
 training_args = SFTConfig(
     output_dir="./output",
-    max_length=512,
+    max_length=1024,
     save_steps=1000,
     save_total_limit=2,
     save_strategy='epoch',
@@ -32,12 +32,11 @@ if __name__ == '__main__':
 
     root= Path(__file__).parent
 
-    stage2_model = (root / "trained-question-evidences-answer").as_posix()
+    stage2_model = (root / "trained-question-evidences-answer/fw").as_posix()
 
     # Quantized for smaller size vlm
     model, processor = VLM(stage2_model).load_unsloth_vlm(use_gradient_checkpointing="unsloth",
                                                                                    load_in_4bit=True) # for native model, in future use from_config for custom model
-    model = model.merge_and_unload()
 
     # not using this in the future ,but it is proof of concept for changing training procedure
     processor.image_processor.do_image_splitting = False # natively the processor is split image, but we are passing it different size anyway
@@ -72,6 +71,7 @@ if __name__ == '__main__':
         callbacks=[early_stopping_callback]
     )
     trainer.train(resume_from_checkpoint = False)
-    model.save_pretrained("./output")
-    processor.tokenizer.save_pretrained("./output")
-    processor.save_pretrained("./output")
+    model = model.merge_and_unload()
+    model.save_pretrained("./output/fw")
+    processor.tokenizer.save_pretrained("./output/fw")
+    processor.save_pretrained("./output/fw")
