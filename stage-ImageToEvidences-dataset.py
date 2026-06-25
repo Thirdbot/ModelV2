@@ -34,7 +34,7 @@ if __name__ == '__main__':
             "skip_prepare_dataset": True,  # already prepared for collate
         },
         remove_unused_columns=False,
-        num_train_epochs=40,
+        num_train_epochs=21,
         eval_strategy='epoch',
         learning_rate=2e-5,
         load_best_model_at_end=True,
@@ -46,10 +46,10 @@ if __name__ == '__main__':
     collator = VisionCollator(processor=processor)
     model = FastVisionModel.get_peft_model(
         model,
-        finetune_vision_layers=True,
+        finetune_vision_layers=False,
         finetune_language_layers=True,
         finetune_attention_modules=True,
-        finetune_mlp_modules=False,
+        finetune_mlp_modules=True,
         r=8,
         lora_alpha=8,
     )
@@ -65,7 +65,6 @@ if __name__ == '__main__':
     log_callback = PrintOnPredictTextCallback(trainer=trainer, processor=processor, num_samples=1)
     trainer.add_callback(log_callback)
     trainer.train(resume_from_checkpoint = True)
-    model = model.merge_and_unload()
-    model.save_pretrained("./trained-image-evidences/fw")
+    model.save_pretrained_merged("./trained-image-evidences/fw",processor.tokenizer,save_method='merged_16bit')
     processor.tokenizer.save_pretrained("./trained-image-evidences/fw")
     processor.save_pretrained("./trained-image-evidences/fw")

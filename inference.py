@@ -6,7 +6,7 @@ from data import TemplateDataset,ie_process
 import random
 
 class InferenceLang:
-    def __init__(self, model_path,max_seq=1024):
+    def __init__(self, model_path,max_seq=120):
         self.model_path = model_path
         self.max_seq = max_seq
 
