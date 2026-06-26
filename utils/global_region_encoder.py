@@ -3,6 +3,13 @@ from utils.region_encoder import RegionEncoder,NcsEncoder
 from utils.global_encoder import GlobalEncoder
 import torch.nn as nn
 
+
+def norm_to_abs(boxes, W, H):
+    out = boxes.clone()
+    out[..., [0, 2]] *= W
+    out[..., [1, 3]] *= H
+    return out
+
 class BBoxHead(nn.Module):
     def __init__(self, hidden_size=768):
         super().__init__()
@@ -60,21 +67,35 @@ class DualEncoder(nn.Module):
         global_output = self.ge(pixel_values,H,W) # tiling
         global_feature = torch.cat([tile['feature'] for tile in global_output],dim=0)
         bbox_global_tiles = torch.tensor(
-            [tile['bbox_norm'] for tile in global_output]
+            [tile['bbox_norm'] for tile in global_output],
+            dtype=global_feature.dtype,
+            device=global_feature.device,
         )
         global_tile_pos = self.bbox_mlp(bbox_global_tiles)
 
         global_tiles = global_feature + global_tile_pos
-        pred_boxes = self.proposal_head(global_tiles)
+        proposal = self.proposal_head(global_tiles)
+
+        global_cls_pred = proposal['class_logits']
+        roi_bbox = norm_to_abs(proposal['boxes'],W,H)
 
         if self.is_train:
             bboxes = bbox
         else:
-            bboxes = pred_boxes['boxes']
+            bboxes = roi_bbox
 
 
         cropped_image,bbox_norm = self.re(pixel_values,bboxes,H,W)
         ncs_feature = self.ncs_enc(cropped_image) # roi_align for precision cropping and pass to ncs
+        return {
+            "global_tiles": global_tiles,
+            "proposal": proposal,
+            "roi_bbox": roi_bbox,
+            "region_bbox": bboxes,
+            "cropped_image": cropped_image,
+            "region_bbox_norm": bbox_norm,
+            "region_feature": ncs_feature,
+        }
 
 if __name__ == "__main__":
     from data import bcx_process

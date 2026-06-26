@@ -10,23 +10,30 @@ class RegionEncoder:
         self.spatial_scale = spatial_scale
         self.sampling_ratio = sampling_ratio
     def __call__(self, img,bbox,H,W):
-        tensor_image = pil_to_tensor(img).unsqueeze(0) / 255.0
 
-        x1, y1, x2, y2 = bbox
-        tensor_bbox = torch.tensor(
-            [[0, x1, y1, x2, y2]],
-            dtype=torch.float32,
+        img = img.convert("RGB")
+        tensor_image = pil_to_tensor(img).float().unsqueeze(0) / 255.0
+
+        boxes = torch.as_tensor(bbox, dtype=torch.float32)
+        if boxes.ndim == 1:
+            boxes = boxes.unsqueeze(0)
+
+        batch_index = torch.zeros((boxes.shape[0], 1), dtype=boxes.dtype, device=boxes.device)
+        tensor_bbox = torch.cat([batch_index, boxes], dim=-1)
+
+        x1, y1, x2, y2 = boxes.unbind(dim=-1)
+        bbox_norm = torch.stack(
+            [
+                x1 / W,
+                y1 / H,
+                x2 / W,
+                y2 / H,
+                ((x1 + x2) / 2) / W,
+                ((y1 + y2) / 2) / H,
+                ((x2 - x1) * (y2 - y1)) / (W * H),
+            ],
+            dim=-1,
         )
-
-        bbox_norm = [
-            x1 / W,
-            y1 / H,
-            x2 / W,
-            y2 / H,
-            ((x1 + x2) / 2) / W,
-            ((y1 + y2) / 2) / H,
-            ((x2 - x1) * (y2 - y1)) / (W * H),
-        ]
 
 
         return (roi_align(input=tensor_image,boxes=tensor_bbox,output_size=self.output_size,
