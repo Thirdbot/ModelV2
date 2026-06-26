@@ -2,7 +2,7 @@ from VLM import VLM
 from callback import PrintOnPredictTextCallback
 from data import TemplateDataset,ie_process
 
-def stage_1():
+if __name__ == "__main__":
     from unsloth import FastVisionModel
     from data import VisionCollator
     from trl import SFTConfig,SFTTrainer
