@@ -64,7 +64,7 @@ def stage_1():
     )
     log_callback = PrintOnPredictTextCallback(trainer=trainer, processor=processor, num_samples=1)
     trainer.add_callback(log_callback)
-    trainer.train(resume_from_checkpoint = True)
+    trainer.train(resume_from_checkpoint = False)
     model.save_pretrained_merged("./trained-image-evidences/fw",processor.tokenizer,save_method='merged_16bit')
     processor.tokenizer.save_pretrained("./trained-image-evidences/fw")
     processor.save_pretrained("./trained-image-evidences/fw")
