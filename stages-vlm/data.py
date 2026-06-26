@@ -3,7 +3,7 @@ import re
 from datasets import load_dataset,Dataset
 
 """
-3 stages of training that come from 3 format of dataset
+3 stages-vlm of training that come from 3 format of dataset
 1. 1 Image -> Evidences (ie_process)
 2. 1 Image(frozen) + Question + Evidences as instruction -> Answers (qea_process). After answer is included in fist stage, maybe this is no need to train
 3. Images + Question -> Evidences + Answers (preprocess_fn)

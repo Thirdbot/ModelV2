@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "datasets>=4.3.0",
+    "matplotlib>=3.11.0",
     "nvidia-cudnn-cu11>=9.10.2.21",
     "trl==0.21.0",
     "unsloth>=2026.6.8",

@@ -2,7 +2,7 @@ from VLM import VLM
 from callback import PrintOnPredictTextCallback
 from data import TemplateDataset,ie_process
 
-if __name__ == '__main__':
+def stage_1():
     from unsloth import FastVisionModel
     from data import VisionCollator
     from trl import SFTConfig,SFTTrainer
@@ -22,7 +22,7 @@ if __name__ == '__main__':
     )
 
     training_args = SFTConfig(
-        output_dir="./trained-image-evidences",
+        output_dir="../trained-image-evidences",
         max_length=1024,
         save_steps=1000,
         save_total_limit=2,
