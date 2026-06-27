@@ -79,7 +79,6 @@ class DualEncoder(nn.Module):
         global_tiles = global_feature + global_tile_pos
         proposal = self.proposal_head(global_tiles)
 
-        global_cls_pred = proposal['class_logits']
         roi_bbox = norm_to_abs(proposal['boxes'],W,H)
 
         if self.is_train:
