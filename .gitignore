@@ -12,3 +12,5 @@ unsloth_compiled_cache/
 trained-image-evidences/
 trained-question-evidences-answer/
 output/
+encoder/
+decoder/

@@ -16,10 +16,13 @@ class GlobalEncoder(nn.Module):
         self.processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch16")
         self.model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch16")
         self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
         self.output_size = output_size
         self.overlap = overlap
 
     def forward(self, tiles,H,W):
+        device = next(self.model.parameters()).device
         output_tiles = []
         for tile in tiles:
 
@@ -27,6 +30,7 @@ class GlobalEncoder(nn.Module):
                     images=tile["image"],
                     return_tensors="pt",
                 )
+            inputs = {key: value.to(device) for key, value in inputs.items()}
 
             with torch.no_grad():
                 output = self.model(**inputs)

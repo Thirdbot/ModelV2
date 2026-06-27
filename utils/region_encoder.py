@@ -10,8 +10,9 @@ class RegionEncoder:
         self.spatial_scale = spatial_scale
         self.sampling_ratio = sampling_ratio
     def __call__(self, pixel_values,bbox,H,W):
+        device = pixel_values.device
 
-        boxes = torch.as_tensor(bbox, dtype=torch.float32)
+        boxes = torch.as_tensor(bbox, dtype=torch.float32, device=device)
         if boxes.ndim == 1:
             boxes = boxes.unsqueeze(0)
 
@@ -42,6 +43,9 @@ class NcsEncoder(nn.Module):
         super().__init__()
         self.model = ViTModel.from_pretrained("NorskRegnesentralSTI/NCS-v1-2d-base",
                                               add_pooling_layer=False)
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
     def forward(self, img):
         with torch.no_grad():
             output = self.model(pixel_values=img)

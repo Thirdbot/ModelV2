@@ -36,7 +36,7 @@ class BBoxHead(nn.Module):
 
 
 class ProposalHead(nn.Module):
-    def __init__(self, hidden_size=768, num_classes=4):
+    def __init__(self, hidden_size=768, num_classes=6):
         super().__init__()
         self.class_head = nn.Linear(hidden_size, num_classes + 1)
         self.objectness_head = nn.Linear(hidden_size, 1)
@@ -63,7 +63,9 @@ class DualEncoder(nn.Module):
         self.ncs_enc = NcsEncoder()
         self.proposal_head = ProposalHead(768)
 
-    def forward(self,pixel_values,tiles,bbox=None,H=None,W=None):
+    def forward_one(self,pixel_values,tiles,bbox=None,H=None,W=None):
+        device = next(self.parameters()).device
+        pixel_values = pixel_values.to(device)
 
         global_output = self.ge(tiles,H,W) # tiling
         global_feature = torch.cat([tile['feature'] for tile in global_output],dim=0)
@@ -91,6 +93,12 @@ class DualEncoder(nn.Module):
 
         return {
             "global_tiles": global_tiles,
+            "tile_bbox_abs": torch.tensor(
+                [tile["bbox_abs"] for tile in global_output],
+                dtype=global_feature.dtype,
+                device=global_feature.device,
+            ),
+            "tile_bbox_norm": bbox_global_tiles,
             "proposal": proposal,
             "roi_bbox": roi_bbox,
             "region_bbox": bboxes,
@@ -98,6 +106,31 @@ class DualEncoder(nn.Module):
             "region_bbox_norm": bbox_norm,
             "region_feature": ncs_feature,
         }
+
+    def forward(self,pixel_values,tiles,bbox=None,H=None,W=None):
+        if isinstance(pixel_values, list):
+            outputs = []
+            for idx, pixel_value in enumerate(pixel_values):
+                sample_bbox = bbox[idx] if bbox is not None else None
+                sample_h, sample_w = H[idx], W[idx]
+                outputs.append(
+                    self.forward_one(
+                        pixel_values=pixel_value,
+                        tiles=tiles[idx],
+                        bbox=sample_bbox,
+                        H=sample_h,
+                        W=sample_w,
+                    )
+                )
+            return outputs
+
+        return self.forward_one(
+            pixel_values=pixel_values,
+            tiles=tiles,
+            bbox=bbox,
+            H=H,
+            W=W,
+        )
 
 if __name__ == "__main__":
     from utils.data import bcx_process
@@ -126,14 +159,3 @@ if __name__ == "__main__":
           f"test: {len(test_dataset)}\n"
           f"eval: {len(eval_dataset)}\n"
           f"example: {train_dataset[0]}")
-
-    # for idx,example in enumerate(temped_dataset):
-    #     pass
-    #     # print("="*100)
-    #     # print(f"image at index{idx}")
-    #     # print(f"total cropped image:{len(cropped_image)}")
-    #     # for idx,data in enumerate(global_feature):
-    #     #     print(f"\t global feature at index {idx} at bbox {data['bbox_abs']} to bbox_norm: {data['bbox_norm']} size:{data['feature'].shape}")
-    #     # print(f"\t\t local feature at bbox {example['bbox']} to  bbox_norm {bbox_norm} size: {ncs_feature.shape}")
-    #
-    #     # tiles_token = global_feature
