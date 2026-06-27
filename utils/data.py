@@ -56,7 +56,11 @@ def simple_tiling(img,H,W,tile_size,stride):
 
 
 def extract_regions(text):
-    return re.findall(r"<region>.*?</region>", text)
+    return re.findall(r"<region>.*?</region>", text, flags=re.DOTALL)
+
+
+def remove_bbox_values(text):
+    return re.sub(r"<bbox>.*?</bbox>", "<bbox></bbox>", text, flags=re.DOTALL)
 
 def bcx_process(example):
     """
@@ -141,7 +145,7 @@ def encoder_decoder_process(example):
         region_idx = data['region_idx']
         evidence = extract_regions(evidence_str)
         if evidence and len(evidence) > region_idx:
-            evidence_per_region = evidence[region_idx]
+            evidence_per_region = remove_bbox_values(evidence[region_idx])
         else:
             evidence_per_region = ""
 
@@ -224,5 +228,7 @@ class EncoderDecoderCollate:
             "sizes": [(ex["H"], ex["W"]) for ex in examples],
             "input_ids": text_batch["input_ids"],
             "attention_mask": text_batch["attention_mask"],
+            "prompt_input_ids": prompt_batch["input_ids"],
+            "prompt_attention_mask": prompt_batch["attention_mask"],
             "labels": labels,
         }

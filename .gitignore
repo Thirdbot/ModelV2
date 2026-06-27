@@ -13,4 +13,4 @@ trained-image-evidences/
 trained-question-evidences-answer/
 output/
 encoder/
-decoder/
+GLaMM/
