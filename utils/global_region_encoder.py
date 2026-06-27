@@ -63,8 +63,9 @@ class DualEncoder(nn.Module):
         self.ncs_enc = NcsEncoder()
         self.proposal_head = ProposalHead(768)
 
-    def forward(self,pixel_values,bbox=None,H=None,W=None):
-        global_output = self.ge(pixel_values,H,W) # tiling
+    def forward(self,pixel_values,tiles,bbox=None,H=None,W=None):
+
+        global_output = self.ge(tiles,H,W) # tiling
         global_feature = torch.cat([tile['feature'] for tile in global_output],dim=0)
         bbox_global_tiles = torch.tensor(
             [tile['bbox_norm'] for tile in global_output],
@@ -87,6 +88,7 @@ class DualEncoder(nn.Module):
 
         cropped_image,bbox_norm = self.re(pixel_values,bboxes,H,W)
         ncs_feature = self.ncs_enc(cropped_image) # roi_align for precision cropping and pass to ncs
+
         return {
             "global_tiles": global_tiles,
             "proposal": proposal,
@@ -98,7 +100,7 @@ class DualEncoder(nn.Module):
         }
 
 if __name__ == "__main__":
-    from data import bcx_process
+    from utils.data import bcx_process
     from datasets import load_dataset, Dataset
     # inspecting
     dataset = load_dataset("thirdExec/synthetic-seismic-vlm")
@@ -112,16 +114,26 @@ if __name__ == "__main__":
         else:
             rows.append(processed)
     temped_dataset = Dataset.from_list(rows)
-    print(temped_dataset)
+    saved_use_dataset = temped_dataset.train_test_split(0.2)
+    saved_test_dataset = saved_use_dataset['test'].train_test_split(0.5)
+
+    train_dataset = saved_use_dataset['train']
+    eval_dataset = saved_test_dataset['test']
+    test_dataset = saved_test_dataset['test']
 
 
-    for idx,example in enumerate(temped_dataset):
+    print(f"train: {len(train_dataset)}\n"
+          f"test: {len(test_dataset)}\n"
+          f"eval: {len(eval_dataset)}\n"
+          f"example: {train_dataset[0]}")
 
-        # print("="*100)
-        # print(f"image at index{idx}")
-        # print(f"total cropped image:{len(cropped_image)}")
-        # for idx,data in enumerate(global_feature):
-        #     print(f"\t global feature at index {idx} at bbox {data['bbox_abs']} to bbox_norm: {data['bbox_norm']} size:{data['feature'].shape}")
-        # print(f"\t\t local feature at bbox {example['bbox']} to  bbox_norm {bbox_norm} size: {ncs_feature.shape}")
-
-        tiles_token = global_feature
+    # for idx,example in enumerate(temped_dataset):
+    #     pass
+    #     # print("="*100)
+    #     # print(f"image at index{idx}")
+    #     # print(f"total cropped image:{len(cropped_image)}")
+    #     # for idx,data in enumerate(global_feature):
+    #     #     print(f"\t global feature at index {idx} at bbox {data['bbox_abs']} to bbox_norm: {data['bbox_norm']} size:{data['feature'].shape}")
+    #     # print(f"\t\t local feature at bbox {example['bbox']} to  bbox_norm {bbox_norm} size: {ncs_feature.shape}")
+    #
+    #     # tiles_token = global_feature

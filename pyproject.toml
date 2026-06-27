@@ -8,6 +8,7 @@ dependencies = [
     "datasets>=4.3.0",
     "matplotlib>=3.11.0",
     "nvidia-cudnn-cu11>=9.10.2.21",
+    "pytorch-lightning>=2.6.5",
     "trl==0.21.0",
     "unsloth>=2026.6.8",
     "wandb>=0.27.2",

@@ -9,10 +9,7 @@ class RegionEncoder:
         self.output_size = output_size
         self.spatial_scale = spatial_scale
         self.sampling_ratio = sampling_ratio
-    def __call__(self, img,bbox,H,W):
-
-        img = img.convert("RGB")
-        tensor_image = pil_to_tensor(img).float().unsqueeze(0) / 255.0
+    def __call__(self, pixel_values,bbox,H,W):
 
         boxes = torch.as_tensor(bbox, dtype=torch.float32)
         if boxes.ndim == 1:
@@ -36,7 +33,7 @@ class RegionEncoder:
         )
 
 
-        return (roi_align(input=tensor_image,boxes=tensor_bbox,output_size=self.output_size,
+        return (roi_align(input=pixel_values,boxes=tensor_bbox,output_size=self.output_size,
                          spatial_scale=self.spatial_scale,sampling_ratio=self.sampling_ratio),
                 bbox_norm)
 
