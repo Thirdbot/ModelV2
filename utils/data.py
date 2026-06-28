@@ -2,8 +2,9 @@ import json
 import re
 from PIL import ImageOps
 import torch
-from torch.nn.modules import padding
 from torchvision.transforms.functional import pil_to_tensor
+
+SPECIAL_TOKENS = ["<OBJ>", "<BBOX>", "<NUM>", "<REG>", "<SEG>"]
 
 
 def simple_tiling(img,H,W,tile_size,stride):
@@ -56,11 +57,40 @@ def simple_tiling(img,H,W,tile_size,stride):
 
 
 def extract_regions(text):
-    return re.findall(r"<region>.*?</region>", text, flags=re.DOTALL)
+    return re.findall(r"<region>.*?</region>", text or "", flags=re.DOTALL)
 
 
-def remove_bbox_values(text):
-    return re.sub(r"<bbox>.*?</bbox>", "<bbox></bbox>", text, flags=re.DOTALL)
+def strip_region_tags(text):
+    text = re.sub(r"</?region>", "", text or "", flags=re.DOTALL)
+    text = re.sub(r"<SEG>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<bbox>.*?</bbox>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<center>.*?</center>", "<nums><NUM></nums>", text, flags=re.DOTALL)
+    text = text.strip()
+    return text
+
+
+def replace_structured_values(text):
+    text = re.sub(r"<bbox>.*?</bbox>", "<bbox><BBOX></bbox>", text or "", flags=re.DOTALL)
+    text = re.sub(r"<center>.*?</center>", "<nums><NUM></nums>", text, flags=re.DOTALL)
+    return text
+
+
+def build_region_target(region, evidence_text, answer_text):
+    evidence = strip_region_tags(evidence_text)
+    if not evidence:
+        evidence = f"The region contains a visible {region.get('object_type', 'geological')} feature."
+
+    answer = replace_structured_values(answer_text).strip()
+    return (
+        "<region>\n"
+        "<object><OBJ></object>\n"
+        "<class_id><OBJ></class_id>\n"
+        f"<evidence>{evidence}</evidence>\n"
+        "<bbox><BBOX></bbox>\n"
+        "<SEG>\n"
+        "</region>\n"
+        f"{answer}"
+    )
 
 def bcx_process(example):
     """
@@ -120,10 +150,13 @@ def encoder_decoder_process(example):
     regions = example['regions']
     regions = json.loads(regions)
     evidence_str = example['evidence']
+    answer_str = example.get("answer", "")
 
     stage1_instruction = (
         "Identify the seismic feature in the image and output one grounded "
-        "<region>...</region> block with object, class_id, color, evidence, bbox, and <SEG>."
+        "<region>...</region> block with object, class_id, evidence, bbox, and <SEG>, "
+        "then output the final answer. Use <OBJ>, <BBOX>, and <NUM> placeholders "
+        "for structured values predicted by the grounding heads."
     )
     # map image and region together
     info = []
@@ -145,9 +178,9 @@ def encoder_decoder_process(example):
         region_idx = data['region_idx']
         evidence = extract_regions(evidence_str)
         if evidence and len(evidence) > region_idx:
-            evidence_per_region = remove_bbox_values(evidence[region_idx])
+            evidence_per_region = build_region_target(data, evidence[region_idx], answer_str)
         else:
-            evidence_per_region = ""
+            evidence_per_region = build_region_target(data, "", answer_str)
 
         # this will be broad low level evidence-image mapping since question and answer can mislead 1-Many problem.
 
@@ -222,6 +255,7 @@ class EncoderDecoderCollate:
         return {
             "images": [ex['i'] for ex in examples],
             "pixel_values": [pil_to_tensor(ex["i"].convert("RGB")).float().unsqueeze(0) / 255.0 for ex in examples],
+            "mask_values": [pil_to_tensor(ex["m"].convert("L")).float().unsqueeze(0) / 255.0 for ex in examples],
             "tiles": [simple_tiling(ex["i"], ex["H"], ex["W"], 224, 112) for ex in examples],
             "boxes": [ex["bbox"] for ex in examples],
             "label": torch.tensor([ex["label"] for ex in examples], dtype=torch.long),

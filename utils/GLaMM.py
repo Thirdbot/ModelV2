@@ -15,6 +15,7 @@ class SeismicGLaMM(nn.Module):
         pixel_values,
         tiles,
         bbox=None,
+        class_ids=None,
         H=None,
         W=None,
         input_ids=None,
@@ -25,6 +26,7 @@ class SeismicGLaMM(nn.Module):
             pixel_values=pixel_values,
             tiles=tiles,
             bbox=bbox,
+            class_ids=class_ids,
             H=H,
             W=W,
         )

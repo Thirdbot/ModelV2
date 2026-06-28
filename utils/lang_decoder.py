@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer,AutoModelForCausalLM
+from utils.data import SPECIAL_TOKENS
 
 
 class VLBridge(nn.Module):
@@ -72,6 +73,17 @@ class Decoder(nn.Module):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(model_name)
+        missing_tokens = [
+            token for token in SPECIAL_TOKENS
+            if token not in self.tokenizer.get_vocab()
+        ]
+        if missing_tokens:
+            self.tokenizer.add_special_tokens(
+                {"additional_special_tokens": missing_tokens}
+            )
+            self.model.resize_token_embeddings(len(self.tokenizer))
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         decoder_dim = self.model.get_input_embeddings().embedding_dim
         self.vl_bridge = VLBridge(decoder_dim=decoder_dim)
 

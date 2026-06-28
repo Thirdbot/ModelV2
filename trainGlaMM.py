@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from datasets import Dataset, load_dataset
 from torch.utils.data import DataLoader
+from torchvision.ops import roi_align
 
 from utils.GLaMM import SeismicGLaMM
 from utils.data import EncoderDecoderCollate, encoder_decoder_process
@@ -19,6 +20,7 @@ LEARNING_RATE = 1e-5
 NUM_WORKERS = 0
 POSITIVE_COVERAGE_THRESHOLD = 0.25
 GROUNDING_LOSS_WEIGHT = 1.0
+MASK_LOSS_WEIGHT = 1.0
 
 
 def build_dataset():
@@ -53,6 +55,7 @@ class GLaMMTrainer(pl.LightningModule):
             pixel_values=batch["pixel_values"],
             tiles=batch["tiles"],
             bbox=batch["boxes"],
+            class_ids=batch["label"],
             H=heights,
             W=widths,
             input_ids=batch["input_ids"].to(self.device),
@@ -135,6 +138,48 @@ class GLaMMTrainer(pl.LightningModule):
         }
         return grounding_loss, log_values
 
+    def crop_mask_target(self, mask_value, box, output_size, device):
+        mask_value = mask_value.to(device)
+        boxes = torch.as_tensor(box, dtype=torch.float32, device=device)
+        if boxes.ndim == 1:
+            boxes = boxes.unsqueeze(0)
+        batch_index = torch.zeros((boxes.shape[0], 1), dtype=boxes.dtype, device=device)
+        rois = torch.cat([batch_index, boxes], dim=-1)
+        return roi_align(
+            input=mask_value,
+            boxes=rois,
+            output_size=output_size,
+            spatial_scale=1,
+            sampling_ratio=2,
+        ).clamp(0, 1)
+
+    def compute_mask_loss(self, outputs, batch):
+        losses = []
+        bce_losses = []
+        dice_losses = []
+
+        for idx, output in enumerate(outputs):
+            logits = output["mask_logits"]
+            target = self.crop_mask_target(
+                mask_value=batch["mask_values"][idx],
+                box=batch["boxes"][idx],
+                output_size=logits.shape[-2:],
+                device=logits.device,
+            )
+            bce = F.binary_cross_entropy_with_logits(logits, target)
+            probs = logits.sigmoid()
+            intersection = (probs * target).sum(dim=(-1, -2, -3))
+            denom = probs.sum(dim=(-1, -2, -3)) + target.sum(dim=(-1, -2, -3))
+            dice = 1.0 - ((2.0 * intersection + 1.0) / (denom + 1.0)).mean()
+            losses.append(bce + dice)
+            bce_losses.append(bce.detach())
+            dice_losses.append(dice.detach())
+
+        return torch.stack(losses).mean(), {
+            "mask_bce_loss": torch.stack(bce_losses).mean(),
+            "mask_dice_loss": torch.stack(dice_losses).mean(),
+        }
+
     def shared_step(self, batch, stage):
         outputs = self(batch)
         text_loss = outputs["loss"]
@@ -142,13 +187,21 @@ class GLaMMTrainer(pl.LightningModule):
             outputs["dual_outputs"],
             batch,
         )
-        loss = text_loss + GROUNDING_LOSS_WEIGHT * grounding_loss
+        mask_loss, mask_logs = self.compute_mask_loss(outputs["dual_outputs"], batch)
+        loss = (
+            text_loss
+            + GROUNDING_LOSS_WEIGHT * grounding_loss
+            + MASK_LOSS_WEIGHT * mask_loss
+        )
 
         batch_size = len(batch["boxes"])
         self.log(f"{stage}/loss", loss, prog_bar=True, batch_size=batch_size)
         self.log(f"{stage}/text_loss", text_loss.detach(), prog_bar=False, batch_size=batch_size)
         self.log(f"{stage}/grounding_loss", grounding_loss.detach(), prog_bar=False, batch_size=batch_size)
+        self.log(f"{stage}/mask_loss", mask_loss.detach(), prog_bar=False, batch_size=batch_size)
         for key, value in grounding_logs.items():
+            self.log(f"{stage}/{key}", value, prog_bar=False, batch_size=batch_size)
+        for key, value in mask_logs.items():
             self.log(f"{stage}/{key}", value, prog_bar=False, batch_size=batch_size)
         return loss
 

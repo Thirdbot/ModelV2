@@ -49,6 +49,31 @@ class ProposalHead(nn.Module):
             "boxes": self.bbox_head(tile_tokens),
         }
 
+
+class MaskHead(nn.Module):
+    def __init__(self, hidden_size=768, base_channels=128, start_size=14):
+        super().__init__()
+        self.start_size = start_size
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, base_channels * start_size * start_size),
+            nn.GELU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(base_channels, 64, kernel_size=2, stride=2),
+            nn.GELU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2),
+            nn.GELU(),
+            nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2),
+            nn.GELU(),
+            nn.ConvTranspose2d(16, 1, kernel_size=2, stride=2),
+        )
+
+    def forward(self, region_features):
+        x = self.fc(region_features)
+        x = x.view(region_features.shape[0], -1, self.start_size, self.start_size)
+        return self.decoder(x)
+
+
 class DualEncoder(nn.Module):
     def __init__(self,is_train=False):
         super().__init__()
@@ -62,8 +87,9 @@ class DualEncoder(nn.Module):
         self.ge = GlobalEncoder(output_size=224, overlap=112)
         self.ncs_enc = NcsEncoder()
         self.proposal_head = ProposalHead(768)
+        self.mask_head = MaskHead(768)
 
-    def forward_one(self,pixel_values,tiles,bbox=None,H=None,W=None):
+    def forward_one(self,pixel_values,tiles,bbox=None,class_ids=None,H=None,W=None):
         device = next(self.parameters()).device
         pixel_values = pixel_values.to(device)
 
@@ -83,12 +109,17 @@ class DualEncoder(nn.Module):
 
         if self.is_train:
             bboxes = bbox
+            region_class_ids = torch.as_tensor(class_ids, dtype=torch.long, device=device)
+            if region_class_ids.ndim == 0:
+                region_class_ids = region_class_ids.unsqueeze(0)
         else:
             bboxes = roi_bbox
+            region_class_ids = proposal["class_logits"].argmax(dim=-1)
 
 
         cropped_image,bbox_norm = self.re(pixel_values,bboxes,H,W)
         ncs_feature = self.ncs_enc(cropped_image) # roi_align for precision cropping and pass to ncs
+        mask_logits = self.mask_head(ncs_feature)
 
         return {
             "global_tiles": global_tiles,
@@ -103,20 +134,24 @@ class DualEncoder(nn.Module):
             "region_bbox": bboxes,
             "cropped_image": cropped_image,
             "region_bbox_norm": bbox_norm,
+            "region_class_ids": region_class_ids,
             "region_feature": ncs_feature,
+            "mask_logits": mask_logits,
         }
 
-    def forward(self,pixel_values,tiles,bbox=None,H=None,W=None):
+    def forward(self,pixel_values,tiles,bbox=None,class_ids=None,H=None,W=None):
         if isinstance(pixel_values, list):
             outputs = []
             for idx, pixel_value in enumerate(pixel_values):
                 sample_bbox = bbox[idx] if bbox is not None else None
+                sample_class_ids = class_ids[idx] if class_ids is not None else None
                 sample_h, sample_w = H[idx], W[idx]
                 outputs.append(
                     self.forward_one(
                         pixel_values=pixel_value,
                         tiles=tiles[idx],
                         bbox=sample_bbox,
+                        class_ids=sample_class_ids,
                         H=sample_h,
                         W=sample_w,
                     )
@@ -127,6 +162,7 @@ class DualEncoder(nn.Module):
             pixel_values=pixel_values,
             tiles=tiles,
             bbox=bbox,
+            class_ids=class_ids,
             H=H,
             W=W,
         )

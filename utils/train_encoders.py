@@ -79,6 +79,7 @@ class EncoderTrainer(pl.LightningModule):
             pixel_values=batch["pixel_values"],
             tiles=batch["tiles"],
             bbox=batch["boxes"],
+            class_ids=batch["label"],
             H=heights,
             W=widths,
         )
