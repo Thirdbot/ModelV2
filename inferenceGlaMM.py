@@ -1,15 +1,24 @@
 from pathlib import Path
+import re
 
 import torch
 from torch.utils.data import DataLoader
 
 from trainGlaMM import GLaMMTrainer, build_dataset
-from utils.data import EncoderDecoderCollate
+from utils.data import BBOX_SLOT, OBJ_SLOT, REG_SLOT, EncoderDecoderCollate
 
 
 CHECKPOINT_DIR = Path("GLaMM")
 NUM_SAMPLES = 5
 MAX_NEW_TOKENS = 180
+CLASS_NAMES = {
+    0: "no_object",
+    1: "fault",
+    2: "closure",
+    3: "salt",
+    4: "onlap",
+    5: "lithology",
+}
 
 
 def find_checkpoint():
@@ -23,9 +32,37 @@ def find_checkpoint():
     return checkpoints[-1]
 
 
+def format_bbox(box):
+    return [int(round(value)) for value in box]
+
+
+def render_slots(text, object_name, bbox, numbers):
+    text = text.replace(OBJ_SLOT, object_name)
+    text = text.replace(BBOX_SLOT, str(format_bbox(bbox)))
+    for value in numbers:
+        text = text.replace(REG_SLOT, f"{value:.4g}", 1)
+    return text
+
+
+def strip_prompt_echo(text):
+    if "<|im_start|>assistant" in text:
+        text = text.split("<|im_start|>assistant", 1)[-1]
+    return text.replace("<|im_end|>", "").strip()
+
+
+def best_proposal(output):
+    proposal = output["proposal"]
+    scores = proposal["objectness_logits"].sigmoid()
+    best_idx = scores.argmax()
+    class_id = int(proposal["class_logits"][best_idx].argmax().detach().cpu().item())
+    bbox = output["roi_bbox"][best_idx].detach().cpu().tolist()
+    score = float(scores[best_idx].detach().cpu().item())
+    return class_id, bbox, score
+
+
 def main():
     checkpoint = find_checkpoint()
-    model = GLaMMTrainer.load_from_checkpoint(checkpoint.as_posix())
+    model = GLaMMTrainer.load_from_checkpoint(checkpoint.as_posix(), strict=False)
     model.eval()
     model.model.dual_encoder.is_train = False
 
@@ -89,6 +126,54 @@ def main():
                 generated[0],
                 skip_special_tokens=False,
             )
+            class_id, predicted_bbox, predicted_score = best_proposal(dual_outputs[0])
+            object_name = CLASS_NAMES.get(class_id, f"class_{class_id}")
+            predicted_numbers = []
+
+            if REG_SLOT in generated_text:
+                if (
+                    generated.shape[1] >= input_ids.shape[1]
+                    and torch.equal(generated[:, :input_ids.shape[1]].to(input_ids.device), input_ids)
+                ):
+                    full_text_ids = generated.to(device)
+                else:
+                    full_text_ids = torch.cat([input_ids, generated.to(device)], dim=1)
+
+                full_text_embeds = model.model.lang_decoder.model.get_input_embeddings()(full_text_ids)
+                full_visual_tokens = visual_tokens.to(dtype=full_text_embeds.dtype)
+                full_inputs_embeds = torch.cat([full_visual_tokens, full_text_embeds], dim=1)
+                full_attention_mask = torch.ones(
+                    full_inputs_embeds.shape[:2],
+                    device=device,
+                    dtype=attention_mask.dtype,
+                )
+                reg_outputs = model.model.lang_decoder.model(
+                    inputs_embeds=full_inputs_embeds,
+                    attention_mask=full_attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                reg_token_id = model.tokenizer.convert_tokens_to_ids(REG_SLOT)
+                reg_batch_idx, reg_token_idx = (full_text_ids == reg_token_id).nonzero(as_tuple=True)
+                if reg_batch_idx.numel() > 0:
+                    reg_hidden = reg_outputs.hidden_states[-1][
+                        reg_batch_idx,
+                        reg_token_idx + full_visual_tokens.shape[1],
+                    ]
+                    predicted_numbers = (
+                        model.slot_reg_head(reg_hidden)
+                        .squeeze(-1)
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+
+            rendered_text = render_slots(
+                strip_prompt_echo(generated_text),
+                object_name=object_name,
+                bbox=predicted_bbox,
+                numbers=predicted_numbers,
+            )
             valid_target = batch["labels"][0] != -100
             target_text = model.tokenizer.decode(
                 batch["labels"][0][valid_target],
@@ -99,8 +184,15 @@ def main():
             print(f"sample: {idx}")
             print("TARGET:")
             print(target_text.strip())
+            print(f"PREDICTED CLASS: {class_id} ({object_name})")
+            print(f"PREDICTED SCORE: {predicted_score:.4f}")
+            print(f"PREDICTED BBOX: {format_bbox(predicted_bbox)}")
+            if predicted_numbers:
+                print(f"PREDICTED NUMS: {[round(value, 4) for value in predicted_numbers]}")
             print("GENERATED:")
             print(generated_text.strip())
+            print("RENDERED:")
+            print(rendered_text)
 
 
 if __name__ == "__main__":

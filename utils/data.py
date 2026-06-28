@@ -4,7 +4,12 @@ from PIL import ImageOps
 import torch
 from torchvision.transforms.functional import pil_to_tensor
 
-SPECIAL_TOKENS = ["<OBJ>", "<BBOX>", "<NUM>", "<REG>", "<SEG>"]
+OBJ_SLOT = "<OBJ_SLOT>"
+BBOX_SLOT = "<BBOX_SLOT>"
+REG_SLOT = "<REG_SLOT>"
+SEG_TOKEN = "<SEG>"
+SPECIAL_TOKENS = [OBJ_SLOT, BBOX_SLOT, REG_SLOT, SEG_TOKEN]
+NUMBER_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+)")
 
 
 def simple_tiling(img,H,W,tile_size,stride):
@@ -60,37 +65,63 @@ def extract_regions(text):
     return re.findall(r"<region>.*?</region>", text or "", flags=re.DOTALL)
 
 
-def strip_region_tags(text):
+def extract_numbers(value):
+    return [float(match.group(0)) for match in NUMBER_RE.finditer(value or "")]
+
+
+def replace_numeric_tags(text):
+    numeric_targets = []
+
+    def replace_match(match):
+        tag = match.group(1)
+        values = extract_numbers(match.group(2))
+        numeric_targets.extend(values)
+        if not values:
+            return match.group(0)
+        slots = ", ".join(REG_SLOT for _ in values)
+        return f"<{tag}>{slots}</{tag}>"
+
+    text = re.sub(
+        r"<(NUM|nums|center)>(.*?)</\1>",
+        replace_match,
+        text or "",
+        flags=re.DOTALL,
+    )
+    return text, numeric_targets
+
+
+def clean_evidence_text(text):
     text = re.sub(r"</?region>", "", text or "", flags=re.DOTALL)
-    text = re.sub(r"<SEG>", "", text, flags=re.DOTALL)
+    text = re.sub(re.escape(SEG_TOKEN), "", text, flags=re.DOTALL)
     text = re.sub(r"<bbox>.*?</bbox>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<center>.*?</center>", "<nums><NUM></nums>", text, flags=re.DOTALL)
     text = text.strip()
     return text
 
 
 def replace_structured_values(text):
-    text = re.sub(r"<bbox>.*?</bbox>", "<bbox><BBOX></bbox>", text or "", flags=re.DOTALL)
-    text = re.sub(r"<center>.*?</center>", "<nums><NUM></nums>", text, flags=re.DOTALL)
-    return text
+    text = re.sub(r"<bbox>.*?</bbox>", f"<bbox>{BBOX_SLOT}</bbox>", text or "", flags=re.DOTALL)
+    return replace_numeric_tags(text)
 
 
 def build_region_target(region, evidence_text, answer_text):
-    evidence = strip_region_tags(evidence_text)
+    evidence = clean_evidence_text(evidence_text)
+    evidence, evidence_nums = replace_structured_values(evidence)
     if not evidence:
         evidence = f"The region contains a visible {region.get('object_type', 'geological')} feature."
 
-    answer = replace_structured_values(answer_text).strip()
-    return (
+    answer, answer_nums = replace_structured_values(answer_text)
+    answer = answer.strip()
+    target = (
         "<region>\n"
-        "<object><OBJ></object>\n"
-        "<class_id><OBJ></class_id>\n"
+        f"<object>{OBJ_SLOT}</object>\n"
+        f"<class_id>{OBJ_SLOT}</class_id>\n"
         f"<evidence>{evidence}</evidence>\n"
-        "<bbox><BBOX></bbox>\n"
-        "<SEG>\n"
+        f"<bbox>{BBOX_SLOT}</bbox>\n"
+        f"{SEG_TOKEN}\n"
         "</region>\n"
         f"{answer}"
     )
+    return target, evidence_nums + answer_nums
 
 def bcx_process(example):
     """
@@ -155,7 +186,7 @@ def encoder_decoder_process(example):
     stage1_instruction = (
         "Identify the seismic feature in the image and output one grounded "
         "<region>...</region> block with object, class_id, evidence, bbox, and <SEG>, "
-        "then output the final answer. Use <OBJ>, <BBOX>, and <NUM> placeholders "
+        "then output the final answer. Use <OBJ_SLOT>, <BBOX_SLOT>, and <REG_SLOT> placeholders "
         "for structured values predicted by the grounding heads."
     )
     # map image and region together
@@ -178,9 +209,9 @@ def encoder_decoder_process(example):
         region_idx = data['region_idx']
         evidence = extract_regions(evidence_str)
         if evidence and len(evidence) > region_idx:
-            evidence_per_region = build_region_target(data, evidence[region_idx], answer_str)
+            evidence_per_region, numeric_targets = build_region_target(data, evidence[region_idx], answer_str)
         else:
-            evidence_per_region = build_region_target(data, "", answer_str)
+            evidence_per_region, numeric_targets = build_region_target(data, "", answer_str)
 
         # this will be broad low level evidence-image mapping since question and answer can mislead 1-Many problem.
 
@@ -205,6 +236,7 @@ def encoder_decoder_process(example):
             "m":masks[mask_idx],
             "label": label,
             "bbox": bbox,
+            "numeric_targets": numeric_targets,
             "H": H,
             "W": W,
             "message":conversations,
@@ -251,6 +283,16 @@ class EncoderDecoderCollate:
             labels[i, :prompt_len] = -100
 
         labels[labels == self.tokenizer.pad_token_id] = -100
+        slot_token_ids = {
+            "obj": self.tokenizer.convert_tokens_to_ids(OBJ_SLOT),
+            "bbox": self.tokenizer.convert_tokens_to_ids(BBOX_SLOT),
+            "reg": self.tokenizer.convert_tokens_to_ids(REG_SLOT),
+            "seg": self.tokenizer.convert_tokens_to_ids(SEG_TOKEN),
+        }
+        numeric_targets = [
+            torch.tensor(ex["numeric_targets"], dtype=torch.float32)
+            for ex in examples
+        ]
 
         return {
             "images": [ex['i'] for ex in examples],
@@ -259,6 +301,8 @@ class EncoderDecoderCollate:
             "tiles": [simple_tiling(ex["i"], ex["H"], ex["W"], 224, 112) for ex in examples],
             "boxes": [ex["bbox"] for ex in examples],
             "label": torch.tensor([ex["label"] for ex in examples], dtype=torch.long),
+            "numeric_targets": numeric_targets,
+            "slot_token_ids": slot_token_ids,
             "sizes": [(ex["H"], ex["W"]) for ex in examples],
             "input_ids": text_batch["input_ids"],
             "attention_mask": text_batch["attention_mask"],

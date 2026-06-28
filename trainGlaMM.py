@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.ops import roi_align
 
 from utils.GLaMM import SeismicGLaMM
-from utils.data import EncoderDecoderCollate, encoder_decoder_process
+from utils.data import BBOX_SLOT, OBJ_SLOT, REG_SLOT, EncoderDecoderCollate, encoder_decoder_process
 from utils.train_encoders import box_coverage, xyxy_abs_to_norm
 
 
@@ -21,6 +21,7 @@ NUM_WORKERS = 0
 POSITIVE_COVERAGE_THRESHOLD = 0.25
 GROUNDING_LOSS_WEIGHT = 1.0
 MASK_LOSS_WEIGHT = 1.0
+SLOT_LOSS_WEIGHT = 1.0
 
 
 def build_dataset():
@@ -43,6 +44,18 @@ class GLaMMTrainer(pl.LightningModule):
     def __init__(self):
         super().__init__()
         self.model = SeismicGLaMM()
+        hidden_size = self.model.lang_decoder.model.get_input_embeddings().embedding_dim
+        self.slot_class_head = torch.nn.Linear(hidden_size, 7)
+        self.slot_bbox_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, hidden_size),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_size, 4),
+        )
+        self.slot_reg_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, hidden_size),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_size, 1),
+        )
 
     @property
     def tokenizer(self):
@@ -180,6 +193,100 @@ class GLaMMTrainer(pl.LightningModule):
             "mask_dice_loss": torch.stack(dice_losses).mean(),
         }
 
+    def slot_bbox_to_xyxy(self, hidden):
+        pred = self.slot_bbox_head(hidden).sigmoid()
+        cx = pred[..., 0]
+        cy = pred[..., 1]
+        w = pred[..., 2]
+        h = pred[..., 3]
+        x1 = (cx - 0.5 * w).clamp(0, 1)
+        y1 = (cy - 0.5 * h).clamp(0, 1)
+        x2 = (cx + 0.5 * w).clamp(0, 1)
+        y2 = (cy + 0.5 * h).clamp(0, 1)
+        return torch.stack([x1, y1, x2, y2], dim=-1)
+
+    def get_slot_hidden(self, decoder_outputs, batch, token_name):
+        token_id = batch["slot_token_ids"][token_name]
+        input_ids = batch["input_ids"].to(self.device)
+        batch_idx, token_idx = (input_ids == token_id).nonzero(as_tuple=True)
+        if batch_idx.numel() == 0:
+            return None, None
+
+        hidden = decoder_outputs.hidden_states[-1]
+        visual_len = hidden.shape[1] - input_ids.shape[1]
+        return hidden[batch_idx, token_idx + visual_len], batch_idx
+
+    def boxes_for_batch_indices(self, batch, batch_idx, dtype):
+        boxes = []
+        for idx in batch_idx.detach().cpu().tolist():
+            height, width = batch["sizes"][idx]
+            box = xyxy_abs_to_norm(
+                batch["boxes"][idx],
+                width=width,
+                height=height,
+                device=self.device,
+                dtype=dtype,
+            )
+            boxes.append(box)
+        return torch.stack(boxes, dim=0)
+
+    def compute_slot_loss(self, outputs, batch):
+        decoder_outputs = outputs["decoder_outputs"]
+        zero = outputs["loss"].new_zeros(())
+        logs = {
+            "slot_class_loss": zero.detach(),
+            "slot_bbox_loss": zero.detach(),
+            "slot_reg_loss": zero.detach(),
+        }
+        losses = []
+
+        obj_hidden, obj_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "obj")
+        if obj_hidden is not None:
+            class_targets = batch["label"].to(self.device)[obj_batch_idx]
+            class_loss = F.cross_entropy(self.slot_class_head(obj_hidden), class_targets)
+            losses.append(class_loss)
+            logs["slot_class_loss"] = class_loss.detach()
+
+        bbox_hidden, bbox_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "bbox")
+        if bbox_hidden is not None:
+            bbox_pred = self.slot_bbox_to_xyxy(bbox_hidden)
+            bbox_target = self.boxes_for_batch_indices(
+                batch=batch,
+                batch_idx=bbox_batch_idx,
+                dtype=bbox_pred.dtype,
+            )
+            bbox_loss = F.smooth_l1_loss(bbox_pred, bbox_target)
+            losses.append(bbox_loss)
+            logs["slot_bbox_loss"] = bbox_loss.detach()
+
+        reg_hidden, reg_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "reg")
+        if reg_hidden is not None:
+            targets = []
+            hidden_rows = []
+            cursor = 0
+            for sample_idx, numeric_targets in enumerate(batch["numeric_targets"]):
+                sample_count = int((reg_batch_idx == sample_idx).sum().item())
+                if sample_count == 0:
+                    continue
+                usable_count = min(sample_count, numeric_targets.numel())
+                if usable_count == 0:
+                    cursor += sample_count
+                    continue
+                hidden_rows.append(reg_hidden[cursor:cursor + usable_count])
+                targets.append(numeric_targets[:usable_count].to(self.device))
+                cursor += sample_count
+
+            if hidden_rows:
+                reg_pred = self.slot_reg_head(torch.cat(hidden_rows, dim=0)).squeeze(-1)
+                reg_target = torch.cat(targets, dim=0).to(dtype=reg_pred.dtype)
+                reg_loss = F.smooth_l1_loss(reg_pred, reg_target)
+                losses.append(reg_loss)
+                logs["slot_reg_loss"] = reg_loss.detach()
+
+        if not losses:
+            return zero, logs
+        return torch.stack(losses).mean(), logs
+
     def shared_step(self, batch, stage):
         outputs = self(batch)
         text_loss = outputs["loss"]
@@ -188,10 +295,12 @@ class GLaMMTrainer(pl.LightningModule):
             batch,
         )
         mask_loss, mask_logs = self.compute_mask_loss(outputs["dual_outputs"], batch)
+        slot_loss, slot_logs = self.compute_slot_loss(outputs, batch)
         loss = (
             text_loss
             + GROUNDING_LOSS_WEIGHT * grounding_loss
             + MASK_LOSS_WEIGHT * mask_loss
+            + SLOT_LOSS_WEIGHT * slot_loss
         )
 
         batch_size = len(batch["boxes"])
@@ -199,9 +308,12 @@ class GLaMMTrainer(pl.LightningModule):
         self.log(f"{stage}/text_loss", text_loss.detach(), prog_bar=False, batch_size=batch_size)
         self.log(f"{stage}/grounding_loss", grounding_loss.detach(), prog_bar=False, batch_size=batch_size)
         self.log(f"{stage}/mask_loss", mask_loss.detach(), prog_bar=False, batch_size=batch_size)
+        self.log(f"{stage}/slot_loss", slot_loss.detach(), prog_bar=False, batch_size=batch_size)
         for key, value in grounding_logs.items():
             self.log(f"{stage}/{key}", value, prog_bar=False, batch_size=batch_size)
         for key, value in mask_logs.items():
+            self.log(f"{stage}/{key}", value, prog_bar=False, batch_size=batch_size)
+        for key, value in slot_logs.items():
             self.log(f"{stage}/{key}", value, prog_bar=False, batch_size=batch_size)
         return loss
 
