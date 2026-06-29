@@ -53,13 +53,13 @@ class ProposalHead(nn.Module):
 
 
 class MaskHead(nn.Module):
-    def __init__(self, hidden_size=768, base_channels=128, start_size=14):
+    def __init__(self, hidden_size=768, base_channels=128):
         super().__init__()
-        self.start_size = start_size
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, base_channels * start_size * start_size),
+        self.semantic_proj = nn.Sequential(
+            nn.Linear(hidden_size, base_channels),
             nn.GELU(),
         )
+        self.spatial_proj = nn.Conv2d(hidden_size, base_channels, kernel_size=1)
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(base_channels, 64, kernel_size=2, stride=2),
             nn.GELU(),
@@ -70,10 +70,14 @@ class MaskHead(nn.Module):
             nn.ConvTranspose2d(16, 1, kernel_size=2, stride=2),
         )
 
-    def forward(self, region_features):
-        region_features = region_features.to(dtype=self.fc[0].weight.dtype)
-        x = self.fc(region_features)
-        x = x.view(region_features.shape[0], -1, self.start_size, self.start_size)
+    def forward(self, region_features, spatial_features):
+        target_dtype = self.semantic_proj[0].weight.dtype
+        region_features = region_features.to(dtype=target_dtype)
+        spatial_features = spatial_features.to(dtype=target_dtype)
+
+        semantic = self.semantic_proj(region_features).unsqueeze(-1).unsqueeze(-1)
+        x = self.spatial_proj(spatial_features)
+        x = x + semantic
         return self.decoder(x)
 
 
@@ -121,8 +125,11 @@ class DualEncoder(nn.Module):
 
 
         cropped_image,bbox_norm = self.re(pixel_values,bboxes,H,W)
-        ncs_feature = self.ncs_enc(cropped_image) # roi_align for precision cropping and pass to ncs
-        mask_logits = self.mask_head(ncs_feature)
+        ncs_feature, ncs_spatial_feature = self.ncs_enc(
+            cropped_image,
+            return_spatial=True,
+        ) # roi_align for precision cropping and pass to ncs
+        mask_logits = self.mask_head(ncs_feature, ncs_spatial_feature)
 
         return {
             "global_tiles": global_tiles,
@@ -139,6 +146,7 @@ class DualEncoder(nn.Module):
             "region_bbox_norm": bbox_norm,
             "region_class_ids": region_class_ids,
             "region_feature": ncs_feature,
+            "region_spatial_feature": ncs_spatial_feature,
             "mask_logits": mask_logits,
         }
 

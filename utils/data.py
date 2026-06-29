@@ -6,10 +6,12 @@ from torchvision.transforms.functional import pil_to_tensor
 
 OBJ_SLOT = "<OBJ_SLOT>"
 BBOX_SLOT = "<BBOX_SLOT>"
+CENTER_SLOT = "<CENTER_SLOT>"
 REG_SLOT = "<REG_SLOT>"
 SEG_TOKEN = "<SEG>"
-SPECIAL_TOKENS = [OBJ_SLOT, BBOX_SLOT, REG_SLOT, SEG_TOKEN]
+SPECIAL_TOKENS = [OBJ_SLOT, BBOX_SLOT, CENTER_SLOT, REG_SLOT, SEG_TOKEN]
 NUMBER_RE = re.compile(r"[-+]?(?:\d*\.\d+|\d+)")
+GENERIC_NUM_SCALE = 10.0
 
 
 def simple_tiling(img,H,W,tile_size,stride):
@@ -82,7 +84,7 @@ def replace_numeric_tags(text):
         return f"<{tag}>{slots}</{tag}>"
 
     text = re.sub(
-        r"<(NUM|nums|center)>(.*?)</\1>",
+        r"<(NUM|nums)>(.*?)</\1>",
         replace_match,
         text or "",
         flags=re.DOTALL,
@@ -99,6 +101,7 @@ def clean_evidence_text(text):
 
 def replace_structured_values(text):
     text = re.sub(r"<bbox>.*?</bbox>", f"<bbox>{BBOX_SLOT}</bbox>", text or "", flags=re.DOTALL)
+    text = re.sub(r"<center>.*?</center>", f"<center>{CENTER_SLOT}</center>", text, flags=re.DOTALL)
     return replace_numeric_tags(text)
 
 
@@ -128,6 +131,8 @@ def build_row_target(regions, evidence_text, answer_text):
     class_slot_targets = []
     bbox_slot_targets = []
     bbox_slot_region_indices = []
+    center_slot_targets = []
+    center_slot_region_indices = []
 
     for idx, region in enumerate(regions):
         evidence_block = region_blocks[idx] if idx < len(region_blocks) else ""
@@ -137,6 +142,9 @@ def build_row_target(regions, evidence_text, answer_text):
         class_slot_targets.extend([region["class_id"]] * rendered_region.count(OBJ_SLOT))
         bbox_slot_targets.extend([region["bbox"]] * rendered_region.count(BBOX_SLOT))
         bbox_slot_region_indices.extend([idx] * rendered_region.count(BBOX_SLOT))
+        center = region.get("center")
+        center_slot_targets.extend([center] * rendered_region.count(CENTER_SLOT))
+        center_slot_region_indices.extend([idx] * rendered_region.count(CENTER_SLOT))
 
     answer, answer_nums = replace_structured_values(answer_text)
     numeric_targets.extend(answer_nums)
@@ -146,6 +154,8 @@ def build_row_target(regions, evidence_text, answer_text):
         class_slot_targets,
         bbox_slot_targets,
         bbox_slot_region_indices,
+        center_slot_targets,
+        center_slot_region_indices,
     )
 
 def bcx_process(example):
@@ -216,6 +226,8 @@ def encoder_decoder_process(example):
         class_slot_targets,
         bbox_slot_targets,
         bbox_slot_region_indices,
+        center_slot_targets,
+        center_slot_region_indices,
     ) = build_row_target(regions, evidence_str, answer_str)
     user_text = f"{instruction}\n{question}".strip()
 
@@ -245,6 +257,8 @@ def encoder_decoder_process(example):
         "class_slot_targets": class_slot_targets,
         "bbox_slot_targets": bbox_slot_targets,
         "bbox_slot_region_indices": bbox_slot_region_indices,
+        "center_slot_targets": center_slot_targets,
+        "center_slot_region_indices": center_slot_region_indices,
         "sizes": sizes,
         "message": [
             {
@@ -301,6 +315,7 @@ class EncoderDecoderCollate:
         slot_token_ids = {
             "obj": self.tokenizer.convert_tokens_to_ids(OBJ_SLOT),
             "bbox": self.tokenizer.convert_tokens_to_ids(BBOX_SLOT),
+            "center": self.tokenizer.convert_tokens_to_ids(CENTER_SLOT),
             "reg": self.tokenizer.convert_tokens_to_ids(REG_SLOT),
             "seg": self.tokenizer.convert_tokens_to_ids(SEG_TOKEN),
         }
@@ -315,6 +330,7 @@ class EncoderDecoderCollate:
         numeric_targets = []
         class_slot_targets = []
         bbox_slot_targets = []
+        center_slot_targets = []
 
         for example in examples:
             row_image_counts.append(len(example["i"]))
@@ -337,6 +353,14 @@ class EncoderDecoderCollate:
                 x1, y1, x2, y2 = box
                 bbox_slot_targets.append([x1 / width, y1 / height, x2 / width, y2 / height])
 
+            for center, local_region_index in zip(example["center_slot_targets"], example["center_slot_region_indices"]):
+                if center is None:
+                    continue
+                size_index = row_start + local_region_index
+                height, width = sizes[size_index]
+                cx, cy = center
+                center_slot_targets.append([cx / width, cy / height])
+
         return {
             "images": images,
             "pixel_values": pixel_values,
@@ -344,9 +368,10 @@ class EncoderDecoderCollate:
             "tiles": tiles,
             "boxes": boxes,
             "label": torch.tensor(labels_per_region, dtype=torch.long),
-            "numeric_targets": torch.tensor(numeric_targets, dtype=torch.float32),
+            "numeric_targets": torch.tensor(numeric_targets, dtype=torch.float32) / GENERIC_NUM_SCALE,
             "class_slot_targets": torch.tensor(class_slot_targets, dtype=torch.long),
             "bbox_slot_targets": torch.tensor(bbox_slot_targets, dtype=torch.float32),
+            "center_slot_targets": torch.tensor(center_slot_targets, dtype=torch.float32),
             "row_image_counts": row_image_counts,
             "slot_token_ids": slot_token_ids,
             "sizes": sizes,

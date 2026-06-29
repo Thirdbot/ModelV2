@@ -16,7 +16,7 @@ torch.set_float32_matmul_precision("high")
 
 DATASET_NAME = "thirdExec/synthetic-seismic-vlm"
 SAVE_DIR = Path("GLaMM")
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 MAX_EPOCHS = 600
 LEARNING_RATE = 1e-5
 NUM_WORKERS = 4
@@ -53,6 +53,11 @@ class GLaMMTrainer(pl.LightningModule):
             torch.nn.GELU(),
             torch.nn.Linear(hidden_size, 4),
         )
+        self.slot_center_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden_size, hidden_size),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_size, 2),
+        )
         self.slot_reg_head = torch.nn.Sequential(
             torch.nn.Linear(hidden_size, hidden_size),
             torch.nn.GELU(),
@@ -62,6 +67,18 @@ class GLaMMTrainer(pl.LightningModule):
     @property
     def tokenizer(self):
         return self.model.tokenizer
+
+    def on_load_checkpoint(self, checkpoint):
+        current_state = self.state_dict()
+        checkpoint_state = checkpoint.get("state_dict", {})
+
+        for key in list(checkpoint_state):
+            if key not in current_state or checkpoint_state[key].shape != current_state[key].shape:
+                del checkpoint_state[key]
+
+        for key, value in current_state.items():
+            if key not in checkpoint_state:
+                checkpoint_state[key] = value
 
     def forward(self, batch):
         heights = [size[0] for size in batch["sizes"]]
@@ -209,6 +226,10 @@ class GLaMMTrainer(pl.LightningModule):
         y2 = (cy + 0.5 * h).clamp(0, 1)
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
+    def slot_center_to_xy(self, hidden):
+        hidden = hidden.to(dtype=self.slot_center_head[0].weight.dtype)
+        return self.slot_center_head(hidden).sigmoid()
+
     def get_slot_hidden(self, decoder_outputs, batch, token_name):
         token_id = batch["slot_token_ids"][token_name]
         input_ids = batch["input_ids"].to(self.device)
@@ -240,6 +261,7 @@ class GLaMMTrainer(pl.LightningModule):
         logs = {
             "slot_class_loss": zero.detach(),
             "slot_bbox_loss": zero.detach(),
+            "slot_center_loss": zero.detach(),
             "slot_reg_loss": zero.detach(),
         }
         losses = []
@@ -265,6 +287,19 @@ class GLaMMTrainer(pl.LightningModule):
             bbox_loss = F.smooth_l1_loss(bbox_pred, bbox_target)
             losses.append(bbox_loss)
             logs["slot_bbox_loss"] = bbox_loss.detach()
+
+        center_hidden, center_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "center")
+        if center_hidden is not None:
+            usable_count = min(center_hidden.shape[0], batch["center_slot_targets"].shape[0])
+            if usable_count > 0:
+                center_pred = self.slot_center_to_xy(center_hidden[:usable_count])
+                center_target = batch["center_slot_targets"][:usable_count].to(
+                    device=self.device,
+                    dtype=center_pred.dtype,
+                )
+                center_loss = F.smooth_l1_loss(center_pred, center_target)
+                losses.append(center_loss)
+                logs["slot_center_loss"] = center_loss.detach()
 
         reg_hidden, reg_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "reg")
         if reg_hidden is not None:
@@ -371,7 +406,6 @@ def main():
         log_every_n_steps=10,
         accelerator="auto",
         devices=1,
-        precision="16-mixed",
     )
 
     ckpt_path = SAVE_DIR / "last.ckpt"

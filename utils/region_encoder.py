@@ -46,8 +46,22 @@ class NcsEncoder(nn.Module):
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
-    def forward(self, img):
+    def forward(self, img, return_spatial=False):
         with torch.no_grad():
             output = self.model(pixel_values=img)
             cls_features = output.last_hidden_state[:, 0, :]  # shape: (B, 768)
-            return cls_features
+            if not return_spatial:
+                return cls_features
+
+            patch_tokens = output.last_hidden_state[:, 1:, :]
+            grid_size = int(patch_tokens.shape[1] ** 0.5)
+            if grid_size * grid_size != patch_tokens.shape[1]:
+                return cls_features, None
+
+            spatial_features = patch_tokens.transpose(1, 2).reshape(
+                patch_tokens.shape[0],
+                patch_tokens.shape[2],
+                grid_size,
+                grid_size,
+            )
+            return cls_features, spatial_features
