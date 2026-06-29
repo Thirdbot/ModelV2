@@ -15,7 +15,7 @@ from utils.train_encoders import box_coverage, xyxy_abs_to_norm
 DATASET_NAME = "thirdExec/synthetic-seismic-vlm"
 SAVE_DIR = Path("GLaMM")
 BATCH_SIZE = 1
-MAX_EPOCHS = 50
+MAX_EPOCHS = 600
 LEARNING_RATE = 1e-5
 NUM_WORKERS = 0
 POSITIVE_COVERAGE_THRESHOLD = 0.25
@@ -194,6 +194,7 @@ class GLaMMTrainer(pl.LightningModule):
         }
 
     def slot_bbox_to_xyxy(self, hidden):
+        hidden = hidden.to(dtype=self.slot_bbox_head[0].weight.dtype)
         pred = self.slot_bbox_head(hidden).sigmoid()
         cx = pred[..., 0]
         cy = pred[..., 1]
@@ -242,17 +243,20 @@ class GLaMMTrainer(pl.LightningModule):
 
         obj_hidden, obj_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "obj")
         if obj_hidden is not None:
-            class_targets = batch["label"].to(self.device)[obj_batch_idx]
+            usable_count = min(obj_hidden.shape[0], batch["class_slot_targets"].numel())
+            obj_hidden = obj_hidden[:usable_count].to(dtype=self.slot_class_head.weight.dtype)
+            class_targets = batch["class_slot_targets"][:usable_count].to(self.device)
             class_loss = F.cross_entropy(self.slot_class_head(obj_hidden), class_targets)
             losses.append(class_loss)
             logs["slot_class_loss"] = class_loss.detach()
 
         bbox_hidden, bbox_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "bbox")
         if bbox_hidden is not None:
+            usable_count = min(bbox_hidden.shape[0], batch["bbox_slot_targets"].shape[0])
+            bbox_hidden = bbox_hidden[:usable_count]
             bbox_pred = self.slot_bbox_to_xyxy(bbox_hidden)
-            bbox_target = self.boxes_for_batch_indices(
-                batch=batch,
-                batch_idx=bbox_batch_idx,
+            bbox_target = batch["bbox_slot_targets"][:usable_count].to(
+                device=self.device,
                 dtype=bbox_pred.dtype,
             )
             bbox_loss = F.smooth_l1_loss(bbox_pred, bbox_target)
@@ -261,24 +265,14 @@ class GLaMMTrainer(pl.LightningModule):
 
         reg_hidden, reg_batch_idx = self.get_slot_hidden(decoder_outputs, batch, "reg")
         if reg_hidden is not None:
-            targets = []
-            hidden_rows = []
-            cursor = 0
-            for sample_idx, numeric_targets in enumerate(batch["numeric_targets"]):
-                sample_count = int((reg_batch_idx == sample_idx).sum().item())
-                if sample_count == 0:
-                    continue
-                usable_count = min(sample_count, numeric_targets.numel())
-                if usable_count == 0:
-                    cursor += sample_count
-                    continue
-                hidden_rows.append(reg_hidden[cursor:cursor + usable_count])
-                targets.append(numeric_targets[:usable_count].to(self.device))
-                cursor += sample_count
-
-            if hidden_rows:
-                reg_pred = self.slot_reg_head(torch.cat(hidden_rows, dim=0)).squeeze(-1)
-                reg_target = torch.cat(targets, dim=0).to(dtype=reg_pred.dtype)
+            usable_count = min(reg_hidden.shape[0], batch["numeric_targets"].numel())
+            if usable_count > 0:
+                reg_input = reg_hidden[:usable_count].to(dtype=self.slot_reg_head[0].weight.dtype)
+                reg_pred = self.slot_reg_head(reg_input).squeeze(-1)
+                reg_target = batch["numeric_targets"][:usable_count].to(
+                    device=self.device,
+                    dtype=reg_pred.dtype,
+                )
                 reg_loss = F.smooth_l1_loss(reg_pred, reg_target)
                 losses.append(reg_loss)
                 logs["slot_reg_loss"] = reg_loss.detach()

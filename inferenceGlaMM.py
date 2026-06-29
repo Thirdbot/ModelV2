@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 
 import torch
 from torch.utils.data import DataLoader
@@ -36,9 +35,17 @@ def format_bbox(box):
     return [int(round(value)) for value in box]
 
 
-def render_slots(text, object_name, bbox, numbers):
-    text = text.replace(OBJ_SLOT, object_name)
-    text = text.replace(BBOX_SLOT, str(format_bbox(bbox)))
+def render_slots(text, object_names, bboxes, numbers):
+    object_index = 0
+    while OBJ_SLOT in text and object_names:
+        text = text.replace(OBJ_SLOT, object_names[min(object_index, len(object_names) - 1)], 1)
+        object_index += 1
+
+    bbox_index = 0
+    while BBOX_SLOT in text and bboxes:
+        text = text.replace(BBOX_SLOT, str(format_bbox(bboxes[min(bbox_index, len(bboxes) - 1)])), 1)
+        bbox_index += 1
+
     for value in numbers:
         text = text.replace(REG_SLOT, f"{value:.4g}", 1)
     return text
@@ -58,6 +65,20 @@ def best_proposal(output):
     bbox = output["roi_bbox"][best_idx].detach().cpu().tolist()
     score = float(scores[best_idx].detach().cpu().item())
     return class_id, bbox, score
+
+
+def best_proposals(outputs):
+    classes = []
+    names = []
+    boxes = []
+    scores = []
+    for output in outputs:
+        class_id, bbox, score = best_proposal(output)
+        classes.append(class_id)
+        names.append(CLASS_NAMES.get(class_id, f"class_{class_id}"))
+        boxes.append(bbox)
+        scores.append(score)
+    return classes, names, boxes, scores
 
 
 def main():
@@ -101,7 +122,7 @@ def main():
                 model.model.lang_decoder._build_visual_tokens(output, device)
                 for output in dual_outputs
             ]
-            visual_tokens = visual_tokens[0].unsqueeze(0)
+            visual_tokens = torch.cat(visual_tokens, dim=0).unsqueeze(0)
             text_embeds = model.model.lang_decoder.model.get_input_embeddings()(input_ids)
             visual_tokens = visual_tokens.to(dtype=text_embeds.dtype)
             inputs_embeds = torch.cat([visual_tokens, text_embeds], dim=1)
@@ -126,8 +147,7 @@ def main():
                 generated[0],
                 skip_special_tokens=False,
             )
-            class_id, predicted_bbox, predicted_score = best_proposal(dual_outputs[0])
-            object_name = CLASS_NAMES.get(class_id, f"class_{class_id}")
+            class_ids, object_names, predicted_bboxes, predicted_scores = best_proposals(dual_outputs)
             predicted_numbers = []
 
             if REG_SLOT in generated_text:
@@ -160,6 +180,7 @@ def main():
                         reg_batch_idx,
                         reg_token_idx + full_visual_tokens.shape[1],
                     ]
+                    reg_hidden = reg_hidden.to(dtype=model.slot_reg_head[0].weight.dtype)
                     predicted_numbers = (
                         model.slot_reg_head(reg_hidden)
                         .squeeze(-1)
@@ -170,8 +191,8 @@ def main():
 
             rendered_text = render_slots(
                 strip_prompt_echo(generated_text),
-                object_name=object_name,
-                bbox=predicted_bbox,
+                object_names=object_names,
+                bboxes=predicted_bboxes,
                 numbers=predicted_numbers,
             )
             valid_target = batch["labels"][0] != -100
@@ -184,9 +205,9 @@ def main():
             print(f"sample: {idx}")
             print("TARGET:")
             print(target_text.strip())
-            print(f"PREDICTED CLASS: {class_id} ({object_name})")
-            print(f"PREDICTED SCORE: {predicted_score:.4f}")
-            print(f"PREDICTED BBOX: {format_bbox(predicted_bbox)}")
+            print(f"PREDICTED CLASSES: {list(zip(class_ids, object_names))}")
+            print(f"PREDICTED SCORES: {[round(score, 4) for score in predicted_scores]}")
+            print(f"PREDICTED BBOXES: {[format_bbox(bbox) for bbox in predicted_bboxes]}")
             if predicted_numbers:
                 print(f"PREDICTED NUMS: {[round(value, 4) for value in predicted_numbers]}")
             print("GENERATED:")

@@ -20,6 +20,7 @@ class BBoxHead(nn.Module):
         )
 
     def forward(self, x):
+        x = x.to(dtype=self.net[0].weight.dtype)
         pred = self.net(x).sigmoid()
 
         cx = pred[..., 0]
@@ -43,6 +44,7 @@ class ProposalHead(nn.Module):
         self.bbox_head = BBoxHead(hidden_size)
 
     def forward(self, tile_tokens):
+        tile_tokens = tile_tokens.to(dtype=self.class_head.weight.dtype)
         return {
             "class_logits": self.class_head(tile_tokens),
             "objectness_logits": self.objectness_head(tile_tokens).squeeze(-1),
@@ -69,6 +71,7 @@ class MaskHead(nn.Module):
         )
 
     def forward(self, region_features):
+        region_features = region_features.to(dtype=self.fc[0].weight.dtype)
         x = self.fc(region_features)
         x = x.view(region_features.shape[0], -1, self.start_size, self.start_size)
         return self.decoder(x)
@@ -97,12 +100,12 @@ class DualEncoder(nn.Module):
         global_feature = torch.cat([tile['feature'] for tile in global_output],dim=0)
         bbox_global_tiles = torch.tensor(
             [tile['bbox_norm'] for tile in global_output],
-            dtype=global_feature.dtype,
+            dtype=self.bbox_mlp[0].weight.dtype,
             device=global_feature.device,
         )
         global_tile_pos = self.bbox_mlp(bbox_global_tiles)
 
-        global_tiles = global_feature + global_tile_pos
+        global_tiles = global_feature.to(dtype=global_tile_pos.dtype) + global_tile_pos
         proposal = self.proposal_head(global_tiles)
 
         roi_bbox = norm_to_abs(proposal['boxes'],W,H)

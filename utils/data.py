@@ -93,7 +93,6 @@ def replace_numeric_tags(text):
 def clean_evidence_text(text):
     text = re.sub(r"</?region>", "", text or "", flags=re.DOTALL)
     text = re.sub(re.escape(SEG_TOKEN), "", text, flags=re.DOTALL)
-    text = re.sub(r"<bbox>.*?</bbox>", "", text, flags=re.DOTALL)
     text = text.strip()
     return text
 
@@ -103,25 +102,51 @@ def replace_structured_values(text):
     return replace_numeric_tags(text)
 
 
-def build_region_target(region, evidence_text, answer_text):
-    evidence = clean_evidence_text(evidence_text)
-    evidence, evidence_nums = replace_structured_values(evidence)
-    if not evidence:
-        evidence = f"The region contains a visible {region.get('object_type', 'geological')} feature."
+def build_region_target(region, evidence_text):
+    body = clean_evidence_text(evidence_text)
+    body, numeric_targets = replace_structured_values(body)
+    if not body:
+        body = f"The region contains a visible {region.get('object_type', 'geological')} feature."
+    if BBOX_SLOT not in body:
+        body = f"{body}\n<bbox>{BBOX_SLOT}</bbox>"
 
-    answer, answer_nums = replace_structured_values(answer_text)
-    answer = answer.strip()
     target = (
         "<region>\n"
         f"<object>{OBJ_SLOT}</object>\n"
         f"<class_id>{OBJ_SLOT}</class_id>\n"
-        f"<evidence>{evidence}</evidence>\n"
-        f"<bbox>{BBOX_SLOT}</bbox>\n"
+        f"{body}\n"
         f"{SEG_TOKEN}\n"
-        "</region>\n"
-        f"{answer}"
+        "</region>"
     )
-    return target, evidence_nums + answer_nums
+    return target, numeric_targets
+
+
+def build_row_target(regions, evidence_text, answer_text):
+    region_blocks = extract_regions(evidence_text)
+    rendered_regions = []
+    numeric_targets = []
+    class_slot_targets = []
+    bbox_slot_targets = []
+    bbox_slot_region_indices = []
+
+    for idx, region in enumerate(regions):
+        evidence_block = region_blocks[idx] if idx < len(region_blocks) else ""
+        rendered_region, region_nums = build_region_target(region, evidence_block)
+        rendered_regions.append(rendered_region)
+        numeric_targets.extend(region_nums)
+        class_slot_targets.extend([region["class_id"]] * rendered_region.count(OBJ_SLOT))
+        bbox_slot_targets.extend([region["bbox"]] * rendered_region.count(BBOX_SLOT))
+        bbox_slot_region_indices.extend([idx] * rendered_region.count(BBOX_SLOT))
+
+    answer, answer_nums = replace_structured_values(answer_text)
+    numeric_targets.extend(answer_nums)
+    return (
+        "\n".join(rendered_regions + [answer.strip()]),
+        numeric_targets,
+        class_slot_targets,
+        bbox_slot_targets,
+        bbox_slot_region_indices,
+    )
 
 def bcx_process(example):
     """
@@ -182,66 +207,56 @@ def encoder_decoder_process(example):
     regions = json.loads(regions)
     evidence_str = example['evidence']
     answer_str = example.get("answer", "")
+    instruction = example.get("instruction", "")
+    question = example.get("question", "")
 
-    stage1_instruction = (
-        "Identify the seismic feature in the image and output one grounded "
-        "<region>...</region> block with object, class_id, evidence, bbox, and <SEG>, "
-        "then output the final answer. Use <OBJ_SLOT>, <BBOX_SLOT>, and <REG_SLOT> placeholders "
-        "for structured values predicted by the grounding heads."
-    )
-    # map image and region together
-    info = []
+    (
+        target_text,
+        numeric_targets,
+        class_slot_targets,
+        bbox_slot_targets,
+        bbox_slot_region_indices,
+    ) = build_row_target(regions, evidence_str, answer_str)
+    user_text = f"{instruction}\n{question}".strip()
+
+    row_images = []
+    row_masks = []
+    boxes = []
+    labels = []
+    sizes = []
 
     for data in regions:
-        conversations = []
-        user = {
-            "role": "user",
-            "content": [],
-        }
-        assistant = {
-            "role": "assistant",
-            "content": [],
-        }
-        # map index individual
         image_idx = data['image_idx']
         mask_idx = data['mask_idx']
         assert(image_idx == mask_idx) # check if it same indexes from original dataset
-        region_idx = data['region_idx']
-        evidence = extract_regions(evidence_str)
-        if evidence and len(evidence) > region_idx:
-            evidence_per_region, numeric_targets = build_region_target(data, evidence[region_idx], answer_str)
-        else:
-            evidence_per_region, numeric_targets = build_region_target(data, "", answer_str)
-
-        # this will be broad low level evidence-image mapping since question and answer can mislead 1-Many problem.
-
-        user['content'] = [
-            # {"type": "image"},
-            {"type": "text","text": stage1_instruction}
-        ]
-        # evidence as answer
-        assistant['content'] = [{"type": "text", "text": evidence_per_region}]
-
-        conversations.append(user)
-        conversations.append(assistant)
-
-        bbox = data['bbox']
-
-        label = data['class_id']
-
         W, H = images[image_idx].size
+        row_images.append(images[image_idx])
+        row_masks.append(masks[mask_idx])
+        boxes.append(data["bbox"])
+        labels.append(data["class_id"])
+        sizes.append((H, W))
 
-        info.append({
-            "i":images[image_idx],
-            "m":masks[mask_idx],
-            "label": label,
-            "bbox": bbox,
-            "numeric_targets": numeric_targets,
-            "H": H,
-            "W": W,
-            "message":conversations,
-        })
-    return info
+    return {
+        "i": row_images,
+        "m": row_masks,
+        "label": labels,
+        "bbox": boxes,
+        "numeric_targets": numeric_targets,
+        "class_slot_targets": class_slot_targets,
+        "bbox_slot_targets": bbox_slot_targets,
+        "bbox_slot_region_indices": bbox_slot_region_indices,
+        "sizes": sizes,
+        "message": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": user_text}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": target_text}],
+            },
+        ],
+    }
 
 
 class EncoderDecoderCollate:
@@ -293,17 +308,31 @@ class EncoderDecoderCollate:
             torch.tensor(ex["numeric_targets"], dtype=torch.float32)
             for ex in examples
         ]
+        if len(examples) != 1:
+            raise ValueError("EncoderDecoderCollate currently expects BATCH_SIZE=1 for row-level multi-image training.")
+        example = examples[0]
+        boxes = example["bbox"]
+        labels_per_region = example["label"]
+        sizes = example["sizes"]
+
+        bbox_slot_targets = []
+        for box, size_index in zip(example["bbox_slot_targets"], example["bbox_slot_region_indices"]):
+            height, width = sizes[size_index]
+            x1, y1, x2, y2 = box
+            bbox_slot_targets.append([x1 / width, y1 / height, x2 / width, y2 / height])
 
         return {
-            "images": [ex['i'] for ex in examples],
-            "pixel_values": [pil_to_tensor(ex["i"].convert("RGB")).float().unsqueeze(0) / 255.0 for ex in examples],
-            "mask_values": [pil_to_tensor(ex["m"].convert("L")).float().unsqueeze(0) / 255.0 for ex in examples],
-            "tiles": [simple_tiling(ex["i"], ex["H"], ex["W"], 224, 112) for ex in examples],
-            "boxes": [ex["bbox"] for ex in examples],
-            "label": torch.tensor([ex["label"] for ex in examples], dtype=torch.long),
-            "numeric_targets": numeric_targets,
+            "images": example["i"],
+            "pixel_values": [pil_to_tensor(img.convert("RGB")).float().unsqueeze(0) / 255.0 for img in example["i"]],
+            "mask_values": [pil_to_tensor(mask.convert("L")).float().unsqueeze(0) / 255.0 for mask in example["m"]],
+            "tiles": [simple_tiling(img, size[0], size[1], 224, 112) for img, size in zip(example["i"], sizes)],
+            "boxes": boxes,
+            "label": torch.tensor(labels_per_region, dtype=torch.long),
+            "numeric_targets": numeric_targets[0],
+            "class_slot_targets": torch.tensor(example["class_slot_targets"], dtype=torch.long),
+            "bbox_slot_targets": torch.tensor(bbox_slot_targets, dtype=torch.float32),
             "slot_token_ids": slot_token_ids,
-            "sizes": [(ex["H"], ex["W"]) for ex in examples],
+            "sizes": sizes,
             "input_ids": text_batch["input_ids"],
             "attention_mask": text_batch["attention_mask"],
             "prompt_input_ids": prompt_batch["input_ids"],

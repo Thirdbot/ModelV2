@@ -48,6 +48,10 @@ class VLBridge(nn.Module):
         # region_features: [R, 768]
         # region_bbox_norm: [R, bbox_dim]
 
+        global_tiles = global_tiles.to(dtype=self.global_proj[0].weight.dtype)
+        region_features = region_features.to(dtype=self.region_proj[0].weight.dtype)
+        region_bbox_norm = region_bbox_norm.to(dtype=self.bbox_proj[0].weight.dtype)
+
         global_tokens = self.global_proj(global_tiles)
         global_tokens = global_tokens + self.type_embed.weight[0]
 
@@ -113,6 +117,8 @@ class Decoder(nn.Module):
             self._build_visual_tokens(output, device)
             for output in dual_encoder_outputs
         ]
+        if text_embeds.shape[0] == 1 and len(visual_tokens) > 1:
+            visual_tokens = [torch.cat(visual_tokens, dim=0)]
         max_visual_len = max(token.shape[0] for token in visual_tokens)
         visual_dim = text_embeds.shape[-1]
 
