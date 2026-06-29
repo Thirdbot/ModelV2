@@ -304,33 +304,50 @@ class EncoderDecoderCollate:
             "reg": self.tokenizer.convert_tokens_to_ids(REG_SLOT),
             "seg": self.tokenizer.convert_tokens_to_ids(SEG_TOKEN),
         }
-        numeric_targets = [
-            torch.tensor(ex["numeric_targets"], dtype=torch.float32)
-            for ex in examples
-        ]
-        if len(examples) != 1:
-            raise ValueError("EncoderDecoderCollate currently expects BATCH_SIZE=1 for row-level multi-image training.")
-        example = examples[0]
-        boxes = example["bbox"]
-        labels_per_region = example["label"]
-        sizes = example["sizes"]
-
+        images = []
+        pixel_values = []
+        mask_values = []
+        tiles = []
+        boxes = []
+        labels_per_region = []
+        sizes = []
+        row_image_counts = []
+        numeric_targets = []
+        class_slot_targets = []
         bbox_slot_targets = []
-        for box, size_index in zip(example["bbox_slot_targets"], example["bbox_slot_region_indices"]):
-            height, width = sizes[size_index]
-            x1, y1, x2, y2 = box
-            bbox_slot_targets.append([x1 / width, y1 / height, x2 / width, y2 / height])
+
+        for example in examples:
+            row_image_counts.append(len(example["i"]))
+            row_start = len(boxes)
+            images.extend(example["i"])
+            boxes.extend(example["bbox"])
+            labels_per_region.extend(example["label"])
+            sizes.extend(example["sizes"])
+            class_slot_targets.extend(example["class_slot_targets"])
+            numeric_targets.extend(example["numeric_targets"])
+
+            for img, mask, size in zip(example["i"], example["m"], example["sizes"]):
+                pixel_values.append(pil_to_tensor(img.convert("RGB")).float().unsqueeze(0) / 255.0)
+                mask_values.append(pil_to_tensor(mask.convert("L")).float().unsqueeze(0) / 255.0)
+                tiles.append(simple_tiling(img, size[0], size[1], 224, 112))
+
+            for box, local_region_index in zip(example["bbox_slot_targets"], example["bbox_slot_region_indices"]):
+                size_index = row_start + local_region_index
+                height, width = sizes[size_index]
+                x1, y1, x2, y2 = box
+                bbox_slot_targets.append([x1 / width, y1 / height, x2 / width, y2 / height])
 
         return {
-            "images": example["i"],
-            "pixel_values": [pil_to_tensor(img.convert("RGB")).float().unsqueeze(0) / 255.0 for img in example["i"]],
-            "mask_values": [pil_to_tensor(mask.convert("L")).float().unsqueeze(0) / 255.0 for mask in example["m"]],
-            "tiles": [simple_tiling(img, size[0], size[1], 224, 112) for img, size in zip(example["i"], sizes)],
+            "images": images,
+            "pixel_values": pixel_values,
+            "mask_values": mask_values,
+            "tiles": tiles,
             "boxes": boxes,
             "label": torch.tensor(labels_per_region, dtype=torch.long),
-            "numeric_targets": numeric_targets[0],
-            "class_slot_targets": torch.tensor(example["class_slot_targets"], dtype=torch.long),
+            "numeric_targets": torch.tensor(numeric_targets, dtype=torch.float32),
+            "class_slot_targets": torch.tensor(class_slot_targets, dtype=torch.long),
             "bbox_slot_targets": torch.tensor(bbox_slot_targets, dtype=torch.float32),
+            "row_image_counts": row_image_counts,
             "slot_token_ids": slot_token_ids,
             "sizes": sizes,
             "input_ids": text_batch["input_ids"],

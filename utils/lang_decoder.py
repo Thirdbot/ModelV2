@@ -105,7 +105,20 @@ class Decoder(nn.Module):
             region_class_ids=region_class_ids,
         )
 
-    def forward(self,input_ids,attention_mask,dual_encoder_outputs,labels=None):
+    def group_visual_tokens(self, visual_tokens, row_image_counts, batch_size):
+        if row_image_counts is None:
+            if batch_size == 1 and len(visual_tokens) > 1:
+                return [torch.cat(visual_tokens, dim=0)]
+            return visual_tokens
+
+        grouped = []
+        cursor = 0
+        for count in row_image_counts:
+            grouped.append(torch.cat(visual_tokens[cursor:cursor + count], dim=0))
+            cursor += count
+        return grouped
+
+    def forward(self,input_ids,attention_mask,dual_encoder_outputs,labels=None,row_image_counts=None):
         device = input_ids.device
         text_embeds = self.model.get_input_embeddings()(input_ids)
         model_dtype = text_embeds.dtype
@@ -117,8 +130,11 @@ class Decoder(nn.Module):
             self._build_visual_tokens(output, device)
             for output in dual_encoder_outputs
         ]
-        if text_embeds.shape[0] == 1 and len(visual_tokens) > 1:
-            visual_tokens = [torch.cat(visual_tokens, dim=0)]
+        visual_tokens = self.group_visual_tokens(
+            visual_tokens=visual_tokens,
+            row_image_counts=row_image_counts,
+            batch_size=text_embeds.shape[0],
+        )
         max_visual_len = max(token.shape[0] for token in visual_tokens)
         visual_dim = text_embeds.shape[-1]
 

@@ -21,6 +21,7 @@ class SeismicGLaMM(nn.Module):
         input_ids=None,
         attention_mask=None,
         labels=None,
+        row_image_counts=None,
     ):
         dual_outputs = self.dual_encoder(
             pixel_values=pixel_values,
@@ -42,6 +43,7 @@ class SeismicGLaMM(nn.Module):
             attention_mask=attention_mask,
             labels=labels,
             dual_encoder_outputs=dual_outputs,
+            row_image_counts=row_image_counts,
         )
 
         return {

@@ -8,16 +8,18 @@ from torch.utils.data import DataLoader
 from torchvision.ops import roi_align
 
 from utils.GLaMM import SeismicGLaMM
-from utils.data import BBOX_SLOT, OBJ_SLOT, REG_SLOT, EncoderDecoderCollate, encoder_decoder_process
+from utils.data import EncoderDecoderCollate, encoder_decoder_process
 from utils.train_encoders import box_coverage, xyxy_abs_to_norm
 
 
+torch.set_float32_matmul_precision("high")
+
 DATASET_NAME = "thirdExec/synthetic-seismic-vlm"
 SAVE_DIR = Path("GLaMM")
-BATCH_SIZE = 1
+BATCH_SIZE = 4
 MAX_EPOCHS = 600
 LEARNING_RATE = 1e-5
-NUM_WORKERS = 0
+NUM_WORKERS = 4
 POSITIVE_COVERAGE_THRESHOLD = 0.25
 GROUNDING_LOSS_WEIGHT = 1.0
 MASK_LOSS_WEIGHT = 1.0
@@ -74,6 +76,7 @@ class GLaMMTrainer(pl.LightningModule):
             input_ids=batch["input_ids"].to(self.device),
             attention_mask=batch["attention_mask"].to(self.device),
             labels=batch["labels"].to(self.device),
+            row_image_counts=batch["row_image_counts"],
         )
 
     def compute_sample_grounding_loss(self, output, box, label, height, width):
@@ -297,7 +300,7 @@ class GLaMMTrainer(pl.LightningModule):
             + SLOT_LOSS_WEIGHT * slot_loss
         )
 
-        batch_size = len(batch["boxes"])
+        batch_size = batch["input_ids"].shape[0]
         self.log(f"{stage}/loss", loss, prog_bar=True, batch_size=batch_size)
         self.log(f"{stage}/text_loss", text_loss.detach(), prog_bar=False, batch_size=batch_size)
         self.log(f"{stage}/grounding_loss", grounding_loss.detach(), prog_bar=False, batch_size=batch_size)
@@ -338,6 +341,9 @@ def main():
         shuffle=True,
         num_workers=NUM_WORKERS,
         collate_fn=collator,
+        pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=2 if NUM_WORKERS > 0 else None,
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -345,6 +351,9 @@ def main():
         shuffle=False,
         num_workers=NUM_WORKERS,
         collate_fn=collator,
+        pin_memory=True,
+        persistent_workers=NUM_WORKERS > 0,
+        prefetch_factor=2 if NUM_WORKERS > 0 else None,
     )
 
     checkpoint = pl.callbacks.ModelCheckpoint(
@@ -362,6 +371,7 @@ def main():
         log_every_n_steps=10,
         accelerator="auto",
         devices=1,
+        precision="16-mixed",
     )
 
     ckpt_path = SAVE_DIR / "last.ckpt"
