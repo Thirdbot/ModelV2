@@ -1,8 +1,6 @@
-"""
-use clip with tiles image for global encoder
-"""
 import torch
-from transformers import AutoProcessor, CLIPVisionModel
+from torchvision.transforms.functional import pil_to_tensor
+from transformers import ViTModel
 import torch.nn as nn
 
 class GlobalEncoder(nn.Module):
@@ -13,8 +11,14 @@ class GlobalEncoder(nn.Module):
     """
     def __init__(self,output_size=224,overlap=112):
         super().__init__()
-        self.processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch16")
-        self.model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch16")
+        self.model = ViTModel.from_pretrained(
+            "NorskRegnesentralSTI/NCS-v1-2d-base",
+            add_pooling_layer=False,
+        )
+        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+        self.register_buffer("image_mean", mean, persistent=False)
+        self.register_buffer("image_std", std, persistent=False)
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
@@ -26,14 +30,11 @@ class GlobalEncoder(nn.Module):
         output_tiles = []
         for tile in tiles:
 
-            inputs = self.processor(
-                    images=tile["image"],
-                    return_tensors="pt",
-                )
-            inputs = {key: value.to(device) for key, value in inputs.items()}
+            pixel_values = pil_to_tensor(tile["image"].convert("RGB")).float().unsqueeze(0).to(device) / 255.0
+            pixel_values = (pixel_values - self.image_mean.to(device)) / self.image_std.to(device)
 
             with torch.no_grad():
-                output = self.model(**inputs)
+                output = self.model(pixel_values=pixel_values)
 
             cls_features = output.last_hidden_state[:, 0, :]
             bbox = tile['bbox_abs']

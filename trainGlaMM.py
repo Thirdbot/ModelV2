@@ -233,7 +233,8 @@ class GLaMMTrainer(pl.LightningModule):
     def get_slot_hidden(self, decoder_outputs, batch, token_name):
         token_id = batch["slot_token_ids"][token_name]
         input_ids = batch["input_ids"].to(self.device)
-        batch_idx, token_idx = (input_ids == token_id).nonzero(as_tuple=True)
+        assistant_mask = batch["labels"].to(self.device) != -100
+        batch_idx, token_idx = ((input_ids == token_id) & assistant_mask).nonzero(as_tuple=True)
         if batch_idx.numel() == 0:
             return None, None
 

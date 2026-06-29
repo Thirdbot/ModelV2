@@ -2,7 +2,6 @@ from torchvision.ops import roi_align
 import torch
 import torch.nn as nn
 from transformers import ViTModel
-from torchvision.transforms.functional import pil_to_tensor
 
 class RegionEncoder:
     def __init__(self,output_size,spatial_scale,sampling_ratio):
@@ -43,11 +42,23 @@ class NcsEncoder(nn.Module):
         super().__init__()
         self.model = ViTModel.from_pretrained("NorskRegnesentralSTI/NCS-v1-2d-base",
                                               add_pooling_layer=False)
+        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+        self.register_buffer("image_mean", mean, persistent=False)
+        self.register_buffer("image_std", std, persistent=False)
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
+
+    def normalize(self, img):
+        img = img.float()
+        if img.max() > 2:
+            img = img / 255.0
+        return (img - self.image_mean.to(img.device)) / self.image_std.to(img.device)
+
     def forward(self, img, return_spatial=False):
         with torch.no_grad():
+            img = self.normalize(img)
             output = self.model(pixel_values=img)
             cls_features = output.last_hidden_state[:, 0, :]  # shape: (B, 768)
             if not return_spatial:

@@ -147,6 +147,18 @@ def build_row_target(regions, evidence_text, answer_text):
         center_slot_region_indices.extend([idx] * rendered_region.count(CENTER_SLOT))
 
     answer, answer_nums = replace_structured_values(answer_text)
+    if regions:
+        answer_bbox_count = answer.count(BBOX_SLOT)
+        if answer_bbox_count:
+            bbox_slot_targets.extend([regions[0]["bbox"]] * answer_bbox_count)
+            bbox_slot_region_indices.extend([0] * answer_bbox_count)
+
+        answer_center_count = answer.count(CENTER_SLOT)
+        center = regions[0].get("center")
+        if answer_center_count and center is not None:
+            center_slot_targets.extend([center] * answer_center_count)
+            center_slot_region_indices.extend([0] * answer_center_count)
+
     numeric_targets.extend(answer_nums)
     return (
         "\n".join(rendered_regions + [answer.strip()]),
