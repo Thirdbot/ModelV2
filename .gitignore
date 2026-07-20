@@ -5,7 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-
+.claude
 # Virtual environments
 .venv
 unsloth_compiled_cache/
@@ -15,3 +15,28 @@ output/
 encoder/
 GLaMM/
 docs/
+
+# --- ML artifacts (large / generated) ---
+# model weights & per-stage checkpoints (~GB each)
+*.pt
+*.pth
+*.ckpt
+hybrid/checkpoints/
+# run logs & pid files
+*.log
+*.pid
+# experiment + inference outputs
+hybrid/experiments/
+hybrid/inference_outputs/
+# unsloth scratch
+_unsloth_sentencepiece_temp/
+.cache/
+
+# --- real-field data (Smeaheia) — track only the README, not the downloaded/built data ---
+data/real_data/*
+!data/real_data/README.md
+data/real_data/raw/
+data/real_data/scenes/
+
+# --- generated images (gen-image / demos) ---
+images/
