@@ -104,6 +104,39 @@ def facts_to_kv(facts):
     return kv
 
 
+def fact_preamble(facts):
+    """Consistent fact statements from the MEASURED facts — states EVERY injected fact
+    (count · per-fault dip[/throw] · closure count · per-closure area) in a fixed phrase, in
+    the SAME order as facts_to_kv, so each injected role marker has a home. This GUARANTEES
+    correspondence → reliable copy, for any scene, built from the dataset's own facts at train
+    time (scalable; new fact type = one phrase). Numbers come from vision; the LM copies them.
+    It is only the copy scaffold — the grounded reasoning/narration is free after it."""
+    faults = facts.get("faults", [])
+    parts = [f"There are {len(faults)} faults."]
+    for i, f in enumerate(faults):
+        parts.append(f"Fault {i + 1} dips at {round(float(f['dip']), 1):g} degrees.")
+        if f.get("throw") is not None:
+            parts.append(f"Fault {i + 1} has throw of {round(float(f['throw']))} ms.")
+    closures = facts.get("closures", [])
+    if closures:
+        parts.append(f"There are {len(closures)} closures.")
+        for j, c in enumerate(closures):
+            parts.append(f"Closure {j + 1} covers {round(float(c['area_pct']))} percent.")
+    return " ".join(parts)
+
+
+def grounding_target(facts):
+    """Stage-2 target: the fact preamble as the evidence content (the copy zone)."""
+    return " ".join(f"<evidence> {fact_preamble(facts)} <SEG> </evidence>".split())
+
+
+def narration_target(facts, answer):
+    """Stage-3 target: fact preamble (copy) + empty <think></think> PLACEHOLDER + the grounded
+    answer. Numbers live in the preamble (all injected); the answer carries interpretation. The
+    <think> stays a supervised empty placeholder — reasoning is deferred to a reason set / later."""
+    return " ".join(f"<evidence> {fact_preamble(facts)} <SEG> </evidence> <think></think> {answer}".split())
+
+
 def structured_evidence(ev):
     """Target surface: keep <evidence>/<nums>/<SEG> and the text (incl. "Fault N", "dips at");
     drop the structural wrappers <region>/<object>/<center>/<bbox>. The role marker comes from

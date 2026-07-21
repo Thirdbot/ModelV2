@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from hybrid.model.scenes import build_scenes, MEAS_SCALE
-from hybrid.model.narrator import Narrator, faults_of
+from hybrid.model.narrator import Narrator, faults_of, scene_facts
 from hybrid.train.stage2_detector import (
     train_detector, detected_facts, measure_accuracy, DIP_STRATA,
 )
@@ -64,14 +64,16 @@ def main():
     report_acc("vision")
     save_vision(net, "stage3_vision.pt")
 
-    # ---- Stage 2b grounding: evidence-copy grounds the shared latent ----
+    # ---- Stage 2b grounding: fact-preamble copy grounds the shared latent ----
+    # image -> GT facts: the target's fact preamble is built from these (correspondence), and
+    # facts_to_kv injects the SAME structure inference uses — so every marker has a home.
+    facts_by_img = {s["img"]: scene_facts(s) for s in tr_v}
     nar = Narrator()
-    train_grounding(nar)
+    train_grounding(nar, facts_by_img)
 
     # ---- Stage 3: fuse aligns the grounded narration (geology+grounding frozen).
-    # Segmentor NOT touched (co-refine removed). The LM narrates from the injected facts
-    # only (text-only decoder, no visual tokens — they diluted the digit-bridge copy).
-    train_narrator(nar, epochs=LM_EPOCHS)
+    # Target = fact preamble (copy zone, from measured facts) + grounded answer (free reasoning).
+    train_narrator(nar, facts_by_img, epochs=LM_EPOCHS)
     save_narrator(nar, "stage3_narrator.pt")
 
     # ---- end-to-end facts + overlays ----

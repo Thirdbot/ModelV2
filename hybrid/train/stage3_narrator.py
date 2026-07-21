@@ -8,42 +8,39 @@ and, like the aux heads, it hit the generalization gap; mask generalization is t
 real-field stage's job). The LM narrates from the injected numbers only — decoupled.
 
 `reason` column is empty (no reason data) — the <think> slot stays empty, to be filled
-later by stage-4 RL / a tiny reason set. Reasoning still runs through the grounded latent.
-Output is the LM's; nothing is templated.
+later by a tiny reason set. Reasoning still runs through the grounded latent. The fact
+preamble (copy zone) is built from the measured facts; the answer is the LM's grounded
+reasoning — nothing about the reasoning is templated.
 """
-import re
-
 import torch
 
 from hybrid.data.dataset import load_local_csv
 from hybrid.model.scenes import CSV
-from hybrid.model.narrator import evidence_kv, structured_narration
+from hybrid.model.narrator import facts_to_kv, narration_target
 
-NUMS = re.compile(r"<nums>([-\d.]+)</nums>")
 LM_EPOCHS = 150
 MAX_ROWS = 40
 
 
-def narration_rows():
-    """(role-tagged facts kv, grounded narration target). Tags cleaned to
-    <evidence>/<think>/<answer>/<SEG>, numbers plain; role-tagged numbers injected —
-    the LM copies them into the chain."""
+def narration_rows(facts_by_img):
+    """(injected facts, preamble+answer target). Inject facts_to_kv (same as inference);
+    target = the fact preamble (copy) + the row's grounded answer (reasoning). One row per
+    (image, answer) so the reasoning varies while the fact preamble stays correspondence-exact."""
     out = []
     for r in load_local_csv(csv_path=CSV):
-        ev, an = r.get("evidence") or "", r.get("answer") or ""
-        kv = evidence_kv(ev)
-        if not kv:
+        facts = facts_by_img.get((r.get("image_paths") or [None])[0])
+        if facts is None or not facts["faults"]:
             continue
-        out.append((kv, structured_narration(ev, an)))
+        out.append((facts_to_kv(facts), narration_target(facts, r.get("answer") or "")))
         if len(out) >= MAX_ROWS:
             break
     return out
 
 
-def train_narrator(nar, epochs=LM_EPOCHS):
+def train_narrator(nar, facts_by_img, epochs=LM_EPOCHS):
     """Stage 3: train the fuse (geology+grounding frozen) on the grounded narration."""
     nar.set_stage("s3")
-    data = narration_rows()
+    data = narration_rows(facts_by_img)
     opt = torch.optim.AdamW(nar.trainable_params(), lr=1e-4)
     nar.train_mode()
     print(f"[narrator] grounded narration on {len(data)} rows", flush=True)

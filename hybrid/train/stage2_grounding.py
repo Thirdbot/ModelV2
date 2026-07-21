@@ -9,32 +9,29 @@ import re
 
 import torch
 
-from hybrid.data.dataset import load_local_csv
-from hybrid.model.scenes import CSV
-from hybrid.model.narrator import evidence_kv, structured_evidence
+from hybrid.model.narrator import facts_to_kv, grounding_target
 
 GROUND_EPOCHS = 15
 MAX_ROWS = 40
 
 
-def evidence_rows():
-    """(role-tagged facts, cleaned evidence narration) for rows carrying values.
-    Each value is role-tagged (dip/throw/area/count) by evidence_kv."""
+def evidence_rows(facts_by_img):
+    """(injected facts, fact-preamble target) — one per scene. Inject facts_to_kv (the SAME
+    structure inference injects) and target = the fact preamble, so every marker has a home
+    (correspondence). Built from the measured facts at train time — scalable, no data change."""
     out = []
-    for r in load_local_csv(csv_path=CSV):
-        ev = r.get("evidence") or ""
-        kv = evidence_kv(ev)                            # role-tagged, from the raw evidence
-        if not kv:
+    for img, facts in facts_by_img.items():
+        if not facts["faults"]:
             continue
-        out.append((kv, structured_evidence(ev)))
+        out.append((facts_to_kv(facts), grounding_target(facts)))
         if len(out) >= MAX_ROWS:
             break
     return out
 
 
-def train_grounding(nar, epochs=GROUND_EPOCHS):
+def train_grounding(nar, facts_by_img, epochs=GROUND_EPOCHS):
     nar.set_stage("s2")
-    data = evidence_rows()
+    data = evidence_rows(facts_by_img)
     opt = torch.optim.AdamW(nar.trainable_params(), lr=1e-4)
     nar.train_mode()
     for ep in range(epochs):
