@@ -1,16 +1,13 @@
-"""Stage 2 (new) — the instance reader + the <SEG> mask decoder.
+"""Stage 2 (new) — the instance reader (facts + per-instance masks, one shared trunk).
 
-Replaces the dense-seg + RANSAC front-end. `train_reader` fits the autoregressive
-reader (facts = count/class/dip/throw); `reader_facts` adapts its detections to the
-digit-bridge fact dict; `train_mask_decoder` fits the per-object <SEG> mask decoder
-on the (frozen) narrator's <SEG> hidden states. Accuracy helpers report held-out.
+Replaces the dense-seg + RANSAC front-end. `train_reader` fits the autoregressive reader
+(count/class/dip/throw AND the joint mask head); `reader_facts` adapts its detections to the
+digit-bridge fact dict; `reader_accuracy` reports held-out count/dip/class.
+(The old LM-<SEG> mask decoder path was retired — masks come from the reader now.)
 """
 import torch
 
 from hybrid.model.reader import InstanceReader, scene_to_gt, FAULT, CLOSURE
-from hybrid.model.mask_decoder import SegMaskDecoder, mask_loss
-from hybrid.model.segmenter import field_dice
-from hybrid.model.narrator import scene_facts, facts_to_kv
 
 device = torch.device("cuda")
 
@@ -59,56 +56,3 @@ def reader_accuracy(net, scenes):
 
     def m(x): return (sum(x) / len(x), len(x)) if x else (None, 0)
     return dict(count=m(cnt), dip=m(dip), cls=(hit, tot))
-
-
-def per_obj_target(facts):
-    fs = facts["faults"]
-    parts = ["<evidence>", f"There are {len(fs)} faults."]
-    for i, f in enumerate(fs):
-        parts.append(f"Fault {i + 1} dips at {round(float(f['dip']), 1):g} degrees <SEG>.")
-    parts.append("</evidence>")
-    return " ".join(parts)
-
-
-def fault_masks(scene):
-    return [o["mask"] for o in scene["objs"] if int(o["cls"]) == 1 and float(o["mmask"][0]) > 0]
-
-
-def _mask_rows(nar, scenes):
-    rows = []
-    for s in scenes:
-        facts = scene_facts(s); fm = fault_masks(s)
-        if not fm:
-            continue
-        with torch.no_grad():
-            segh, nseg = nar.seg_hidden(facts_to_kv(facts), per_obj_target(facts))
-        k = min(nseg, len(fm))
-        if k == 0:
-            continue
-        rows.append((segh[:k].float(), s["smap"], torch.stack(fm[:k]).to(device), s["hw"]))
-    return rows
-
-
-def train_mask_decoder(nar, scenes, epochs=150, lr=1e-3):
-    mdec = SegMaskDecoder().to(device)
-    data = _mask_rows(nar, scenes)
-    opt = torch.optim.AdamW(mdec.parameters(), lr=lr)
-    mdec.train()
-    for ep in range(epochs):
-        tot = 0.0
-        for segh, smap, gt, hw in data:
-            opt.zero_grad(); loss = mask_loss(mdec(segh, smap, hw), gt); loss.backward(); opt.step()
-            tot += loss.item()
-        if ep % max(1, epochs // 5) == 0 or ep == epochs - 1:
-            print(f"[mask] ep {ep} loss {tot/max(1,len(data)):.3f}", flush=True)
-    mdec.eval()
-    return mdec
-
-
-@torch.no_grad()
-def mask_accuracy(nar, mdec, scenes):
-    dices = []
-    for segh, smap, gt, hw in _mask_rows(nar, scenes):
-        mk = mdec(segh, smap, hw)
-        dices += [field_dice(mk[i], gt[i]) for i in range(mk.shape[0])]
-    return (sum(dices) / len(dices), len(dices)) if dices else (None, 0)

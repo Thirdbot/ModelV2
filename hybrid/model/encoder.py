@@ -16,6 +16,10 @@ from hybrid.data.config import PATCH, TILE_GRID, TILE_SIZE, TILE_STRIDE
 from hybrid.data.dataset import simple_tiling
 
 device = torch.device("cuda")
+# FILL_TILE=True: proportionally UPSAMPLE an undersized image so its narrow dim fills the
+# 224 tile (14 content patch-cols instead of ~6), instead of padding it. Proportional →
+# preserves aspect ratio → dip angle unchanged. Costs more tiles (taller image).
+FILL_TILE = False
 
 
 class NcsEncoder(nn.Module):
@@ -85,6 +89,11 @@ def stitch(enc, path, black=False):
     per-tile spatial features into one (768, fH, fW) map. Returns (map, (H, W))."""
     im = Image.open(path).convert("RGB")
     W, H = im.size
+    oH, oW = H, W                                          # original (returned; smap may be finer)
+    if FILL_TILE and min(W, H) < TILE_SIZE:               # proportional upsample to fill the tile
+        f = TILE_SIZE / min(W, H)
+        W, H = round(W * f), round(H * f)
+        im = im.resize((W, H), Image.BILINEAR)
     if black:
         im = Image.new("RGB", (W, H), 0)
     fH, fW = max(1, H // PATCH), max(1, W // PATCH)
@@ -101,4 +110,4 @@ def stitch(enc, path, black=False):
             continue
         accum[:, fy:fy + gy, fx:fx + gx] += sp[:, :gy, :gx]
         cnt[:, fy:fy + gy, fx:fx + gx] += 1
-    return accum / cnt.clamp_min(1.0), (H, W)
+    return accum / cnt.clamp_min(1.0), (oH, oW)

@@ -20,8 +20,9 @@ sc.MAX_SCENES = SCENE_CAP
 
 from hybrid.model.scenes import build_scenes
 from hybrid.model.narrator import Narrator, faults_of, scene_facts, facts_to_kv, K_DIP
-from hybrid.train.stage_reader_mask import (
-    train_reader, reader_accuracy, reader_facts, train_mask_decoder, mask_accuracy)
+from hybrid.train.stage_reader_mask import train_reader, reader_accuracy, reader_facts
+from hybrid.model.reader import scene_to_gt
+from hybrid.model.segmenter import field_dice
 from hybrid.train.stage2_grounding import train_grounding
 from hybrid.train.stage3_narrator import train_narrator
 from hybrid.checkpoints import save_narrator
@@ -52,8 +53,17 @@ def main():
     reader = train_reader(tr, epochs=READER_EPOCHS)
     for tag, sp in (("train", tr), ("test(held-out)", te)):
         a = reader_accuracy(reader, sp)
+        dices = []
+        for s in sp:
+            gt = scene_to_gt(s)
+            if not gt:
+                continue
+            ml = reader.tf_masks(s["smap"], gt)
+            dices += [field_dice(ml[i], o["mask_full"].to(device))
+                      for i, o in enumerate(gt) if o["cls"] == 1]
+        md = (sum(dices) / len(dices), len(dices)) if dices else (None, 0)
         print(f"[reader {tag}] count MAE {_fmt(a['count'])} · dip MAE {_fmt(a['dip'])}deg · "
-              f"class {a['cls'][0]}/{a['cls'][1]}", flush=True)
+              f"class {a['cls'][0]}/{a['cls'][1]} · mask dice {_fmt(md)}", flush=True)
     torch.save(reader.state_dict(), CKPT / "reader.pt")
 
     # ---- Stage 3a/b: chatml narrator (copies facts into grounded language) ----
@@ -62,12 +72,6 @@ def main():
     train_grounding(nar, facts_by_img)
     train_narrator(nar, facts_by_img, epochs=LM_EPOCHS)
     save_narrator(nar, "stage3_narrator.pt")
-
-    # ---- Stage 3c: <SEG> mask decoder (per-object, LM frozen) ----
-    mdec = train_mask_decoder(nar, tr)
-    for tag, sp in (("train", tr), ("test(held-out)", te)):
-        print(f"[mask {tag}] per-object dice {_fmt(mask_accuracy(nar, mdec, sp))}", flush=True)
-    torch.save(mdec.state_dict(), CKPT / "mask_decoder.pt")
 
     # ---- end-to-end held-out copy fidelity (reader-detected facts -> narration) ----
     nar.eval_mode()

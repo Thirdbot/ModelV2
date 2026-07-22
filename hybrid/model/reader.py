@@ -113,7 +113,7 @@ class InstanceReader(nn.Module):
 
     def forward(self, smap, gt):
         """Teacher-forced loss on one scene. gt = list of dicts {cls, dip, throw?, area?,
-        ctr(2), mask_fW(fH,fW)}. Returns (loss, parts)."""
+        ctr(2), mask_fW(fH,fW), mask_full(H,W)}. Returns (loss, parts)."""
         memory, coord, (fH, fW) = self._grid(smap)
         K = len(gt)
         cls = torch.tensor([o["cls"] for o in gt], device=device).unsqueeze(0)
@@ -163,6 +163,20 @@ class InstanceReader(nn.Module):
                       + 1 - (2 * (p2 * gm2).sum() + 1) / (p2.sum() + gm2.sum() + 1))
                 L = L + mk; parts["mask"] = mk.item()
         return L, parts
+
+    @torch.no_grad()
+    def tf_masks(self, smap, gt):
+        """Teacher-forced per-object mask logits (interp to GT mask size) — for mask eval."""
+        memory, coord, (fH, fW) = self._grid(smap)
+        K = len(gt)
+        cls = torch.tensor([o["cls"] for o in gt], device=device).unsqueeze(0)
+        ctr = torch.stack([o["ctr"] for o in gt]).unsqueeze(0)
+        tgt = self._seq_embed(cls, ctr)
+        mask = nn.Transformer.generate_square_subsequent_mask(tgt.shape[1]).to(device)
+        h = self.dec(tgt, memory, tgt_mask=mask)
+        ml = torch.einsum("kd,dhw->khw", self.mask_q(h[0, :K]), self._mask_features(memory, fH, fW)[0])
+        Ht, Wt = gt[0]["mask_full"].shape
+        return F.interpolate(ml.unsqueeze(0), size=(Ht, Wt), mode="bilinear", align_corners=False)[0]
 
     @torch.no_grad()
     def detect(self, smap, thresh=0.5, want_masks=False):
