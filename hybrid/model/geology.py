@@ -9,7 +9,7 @@ import hashlib
 import json
 from pathlib import Path
 
-CKPT = Path("hybrid/experiments/ckpt")
+CKPT = Path("hybrid/checkpoints")
 
 # Stage-1 config — the hash of this dict names the cached adapter dir, so it must
 # stay identical to whatever produced the cache. Consumed by both this loader and

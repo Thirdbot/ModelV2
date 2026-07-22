@@ -45,7 +45,10 @@ def format_example(ex):
     ans = ex.get("answer") or ex.get("output") or ex.get("response") or ""
     if not cot and ans:          # single answer field -> treat it as the CoT
         cot, ans = ans, ""
-    assistant = f"<think>{cot.strip()}</think>\n<answer>{ans.strip()}</answer>"
+    # evidence_placeholder: EVERY stage carries the same evidence/think/answer skeleton, so
+    # geology learns to reason in <think> AFTER </evidence> (its position in the narration) —
+    # not at turn-start, which is what made it drift when the fuse placed it after evidence.
+    assistant = f"<evidence></evidence>\n<think>{cot.strip()}</think>\n<answer>{ans.strip()}</answer>"
     return {"messages": [
         {"role": "user", "content": q.strip()},
         {"role": "assistant", "content": assistant},

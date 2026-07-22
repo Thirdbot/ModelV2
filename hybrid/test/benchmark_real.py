@@ -33,22 +33,26 @@ def benchmark(ckpt="stage4_vision_real.pt"):
     scenes, tr, te = load_real_split()
     net = load_vision(VisionModel().to(device), ckpt)
     dices, dip_err, thr_err, ious = [], [], [], []
-    for s in te:
-        seg = net(s["smap"], s["hw"])
-        dices.append(field_dice(seg[0], s["fault_field"]))
+    for cs in te:
+        smap = cs["smap"].to(device)                       # scenes are CPU-offloaded; load one at a time
+        fault_field = cs["fault_field"].to(device)
+        objs = cs["objs"]; hw = cs["hw"]
+        seg = net(smap, hw)
+        dices.append(field_dice(seg[0], fault_field))
         pred = sorted(instance_dips(seg[0]))
-        gt = sorted(float(o["meas"][0]) for o in s["objs"])
+        gt = sorted(float(o["meas"][0]) for o in objs)
         for i, g in enumerate(gt):
             if i < len(pred):
                 dip_err.append(abs(pred[i] - g))
-        facts = net.measure(s["smap"], s["hw"])
-        H, W = s["hw"]
-        for i, f in enumerate(facts["faults"][:len(s["objs"])]):
-            o = s["objs"][i]
+        facts = net.measure(smap, hw)
+        H, W = hw
+        for i, f in enumerate(facts["faults"][:len(objs)]):
+            o = objs[i]
             gb = [o["bbox"][0] * W, o["bbox"][1] * H, o["bbox"][2] * W, o["bbox"][3] * H]
             ious.append(_bbox_iou(f["bbox"], gb))
             if float(o["mmask"][1]) > 0 and f.get("throw") is not None:
                 thr_err.append(abs(f["throw"] - float(o["meas"][1])))
+        del smap, fault_field, seg; torch.cuda.empty_cache()
 
     def m(x):
         return f"{np.mean(x):.2f}(n{len(x)})" if x else "n0"

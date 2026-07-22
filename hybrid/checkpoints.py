@@ -13,13 +13,13 @@ CKPT = Path("hybrid/checkpoints")
 device = torch.device("cuda")
 
 
-def save_vision(net, name="stage2_vision.pt"):
+def save_vision(net, name="stage3_vision.pt"):
     CKPT.mkdir(parents=True, exist_ok=True)
     torch.save(net.state_dict(), CKPT / name)
     print(f"[ckpt] vision -> {CKPT / name}", flush=True)
 
 
-def load_vision(net, name="stage2_vision.pt"):
+def load_vision(net, name="stage3_vision.pt"):
     # strict=False: a checkpoint from before the multi-task heads (box/attr) loads
     # its seg+throw weights and leaves the new heads fresh; a full one loads whole.
     net.load_state_dict(torch.load(CKPT / name, map_location=device), strict=False)

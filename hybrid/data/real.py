@@ -239,19 +239,35 @@ def build_real_scenes():
             continue
         png = RENDER_DIR / f"{segy.parent.name}__{segy.name}.png"
         Image.fromarray(geo["img_arr"]).save(png)
-        smap, _ = stitch(enc, str(png))
-        objs = [{**o, "mask": o["mask"].to(device),
-                 "meas": o["meas"].to(device), "mmask": o["mmask"].to(device)} for o in geo["objs"]]
-        scenes.append(dict(smap=smap, hw=geo["hw"], objs=objs, img=str(png),
-                           fault_field=geo["fault_field"].to(device),
-                           closure_field=torch.zeros(geo["hw"], device=device)))
+        try:
+            smap, _ = stitch(enc, str(png))
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"[real] OOM skip {png.name} hw={geo['hw']}", flush=True); continue
+        # OFFLOAD each scene to CPU: real lines are huge (up to 2301x11657) and the GPU is
+        # 5.67GB — keeping every scene's smap on GPU OOMs. Move to GPU one at a time downstream.
+        objs = [{**o, "mask": o["mask"].cpu(),
+                 "meas": o["meas"].cpu(), "mmask": o["mmask"].cpu()} for o in geo["objs"]]
+        scenes.append(dict(smap=smap.cpu(), hw=geo["hw"], objs=objs, img=str(png),
+                           fault_field=geo["fault_field"].cpu(),
+                           closure_field=torch.zeros(geo["hw"])))
+        del smap; torch.cuda.empty_cache()
         print(f"[real] {png.name}: {len(objs)} faults · hw={geo['hw']}", flush=True)
     return scenes
 
 
+SCENE_CACHE = REAL_ROOT / "real_scenes.pt"
+
+
 def load_real_split(test_frac=0.25):
+    if SCENE_CACHE.exists():
+        scenes = torch.load(SCENE_CACHE, weights_only=False)
+        print(f"[real] cache -> {len(scenes)} scenes", flush=True)
+    else:
+        scenes = build_real_scenes()
+        torch.save(scenes, SCENE_CACHE)
+        print(f"[real] saved {len(scenes)} scenes -> {SCENE_CACHE}", flush=True)
     rng = random.Random(SEED)
-    scenes = build_real_scenes()
     idx = list(range(len(scenes))); rng.shuffle(idx)
     cut = int(len(idx) * (1 - test_frac))
     return scenes, [scenes[i] for i in idx[:cut]], [scenes[i] for i in idx[cut:]]

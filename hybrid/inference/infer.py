@@ -6,9 +6,16 @@ anchors map to mask instances by order. Decoupled: the LM sees numbers, not feat
 """
 import torch
 
-from hybrid.model.narrator import Narrator, faults_of
+from hybrid.model.narrator import Narrator, faults_of, facts_to_kv
 
 device = torch.device("cuda")
+
+# question types shown on the overlay (grounding / geology / mixed)
+QA_QUESTIONS = [
+    ("Grounding", "How many faults are present and what is each fault's dip?"),
+    ("Geology", "What hydrocarbon trap could these faults form?"),
+    ("Mixed", "Given these faults and dips, is the structure prospective? Explain."),
+]
 
 
 def infer_detected(nar, scenes, det_facts):
@@ -21,6 +28,17 @@ def infer_detected(nar, scenes, det_facts):
                else "(nothing detected)")
         out.append((dd, txt))
     return out
+
+
+def _answer_text(narr):
+    """Pull the <answer>…</answer> content out of the full chain (evidence/think/answer)
+    so the overlay shows the actual answer, not the leading evidence. Handles an unclosed
+    <answer> (truncated generation) and strips any stray tags."""
+    import re
+    i = narr.find("<answer>")
+    tail = narr[i + len("<answer>"):] if i >= 0 else narr
+    tail = tail.split("</answer>")[0]
+    return " ".join(re.sub(r"<[^>]+>", " ", tail).split()) or "(no answer)"
 
 
 def render_grounded(narration, facts):
@@ -40,13 +58,23 @@ def collect_demo(net, nar, scenes, scale):
     for s in scenes:
         seg = net(s["smap"], s["hw"])
         facts = net.measure(s["smap"], s["hw"])
-        narr = (nar.generate(facts) if (facts["faults"] or facts["closures"])
-                else "(nothing detected)")
+        has = facts["faults"] or facts["closures"]
+        narr = nar.generate(facts) if has else "(nothing detected)"
+        qa = []                                            # per-question answers (grounding/geology/mixed)
+        if has:
+            kv = facts_to_kv(facts)
+            for label, q in QA_QUESTIONS:
+                try:
+                    ans = nar.narrate(kv, question=q, max_new_tokens=130)
+                except Exception as e:
+                    ans = f"(error: {e})"
+                torch.cuda.empty_cache()
+                qa.append((label, q, ans))
         out.append(dict(img=s["img"], hw=s["hw"],
                         pmask=torch.sigmoid(seg[0]).cpu(),
                         gmask=s["fault_field"].cpu(),
                         faults=facts["faults"], closures=facts["closures"],
-                        gt_dips=faults_of(s["objs"]), narr=narr))
+                        gt_dips=faults_of(s["objs"]), narr=narr, qa=qa))
     return out
 
 
@@ -83,8 +111,8 @@ def save_overlays(demo, out_dir):
             d0.rectangle(f["bbox"], outline=(255, 90, 90), width=1)     # fault box
         for c in closures:
             d0.rectangle(c["bbox"], outline=(90, 150, 255), width=1)    # closure box
-        pw = 480
-        canvas = Image.new("RGB", (W + pw, max(H, 340)), (250, 250, 248))
+        pw = 510
+        canvas = Image.new("RGB", (W + pw, max(H, 680)), (250, 250, 248))
         canvas.paste(img, (0, 0))
         dr = ImageDraw.Draw(canvas)
         x = W + 14; y = 10
@@ -100,11 +128,19 @@ def save_overlays(demo, out_dir):
         for j, c in enumerate(closures[:4]):
             dr.text((x, y), f"  closure {j+1}: area {c['area_pct']:.1f}%", font=fnt, fill=(40, 90, 180)); y += 16
         y += 6
-        dr.text((x, y), "Narration:", font=fntb, fill=(20, 20, 20)); y += 20
-        for ln in textwrap.wrap(narr, 56):
-            dr.text((x, y), ln, font=fnt, fill=(40, 40, 40)); y += 18
-        dr.text((x, y + 4), f"{n_seg} <SEG> anchors → masks (order-mapped)", font=fnt, fill=(90, 90, 90))
-        dr.text((x, canvas.height - 22), "red = pred mask/box · green = GT mask · blue = closure box",
+        dr.text((x, y), "Base narration:", font=fntb, fill=(20, 20, 20)); y += 19
+        for ln in textwrap.wrap(" ".join(narr.split()), 60)[:2]:
+            dr.text((x, y), ln, font=fnt, fill=(40, 40, 40)); y += 16
+        y += 8
+        dr.text((x, y), "Questions → answers:", font=fntb, fill=(20, 20, 20)); y += 20
+        for label, q, ans in d.get("qa", []):
+            for ln in textwrap.wrap(f"[{label}] {q}", 62):
+                dr.text((x, y), ln, font=fntb, fill=(30, 70, 140)); y += 16
+            for ln in textwrap.wrap("A: " + _answer_text(ans), 62)[:3]:
+                dr.text((x, y), ln, font=fnt, fill=(45, 45, 45)); y += 16
+            y += 5
+        dr.text((x, canvas.height - 20),
+                f"red = pred mask/box · green = GT · blue = closure · {n_seg} <SEG>",
                 font=fnt, fill=(120, 120, 120))
         p = out_dir / f"demo_{k+1}.png"
         canvas.save(p); paths.append(str(p))

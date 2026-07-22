@@ -15,6 +15,7 @@ from hybrid.inference.infer import infer_detected
 
 OUT = Path("hybrid/experiments/main_model")
 
+GROUNDING_Q = "How many faults are present and what is each fault's dip?"
 PROBES = ["Interpret the structural setting.",
           "Is this structure prospective for hydrocarbons? Explain.",
           "What kind of trap could these faults form?"]
@@ -56,12 +57,12 @@ def report_split(nar, split):
     for s in split:
         facts = scene_facts(s)
         dips = [f["dip"] for f in facts["faults"]]
-        txt = nar.generate(facts)
+        txt = nar.generate(facts, question=GROUNDING_Q)
         cs += copy_score(txt, dips)
         if dips:
             alt = copy.deepcopy(facts); base = alt["faults"][0]["dip"]
             alt["faults"][0]["dip"] = min(89.0, base + 15.0)
-            txt2 = nar.generate(alt)                      # swap the injected dip, regenerate
+            txt2 = nar.generate(alt, question=GROUNDING_Q)   # swap the injected dip, regenerate
             got = FAULT_LINE.findall(txt2)
             follow += bool(got and abs(float(got[0]) - alt["faults"][0]["dip"]) < 2.0); n_sw += 1
             if len(ex) < 4:

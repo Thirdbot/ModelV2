@@ -45,11 +45,51 @@ def _dice(logit, gt):
     return 1 - (2 * (p * gt).sum() + 1) / (p.sum() + gt.sum() + 1)
 
 
+# --- loss config (overridable by experiments/) ---
+# Main loss = pos-weighted BCE (focal-modulated) + soft-dice, per class channel.
+POS_WEIGHT = 50.0     # BCE positive weight (thin-fault imbalance)
+FOCAL_GAMMA = 2.0     # 0 = plain pos-weighted BCE; >0 = focal hard-pixel modulation
+
+# --- clDice (centerline dice) — ABLATED OUT, kept commented for a possible
+# text-rich/mask-poor revisit. It cost held-out dice for the same over-detection
+# gain focal already gives (see experiments/results/ablation_summary.json).
+# def _min_pool(x):
+#     return -F.max_pool2d(-x, 3, 1, 1)             # soft erosion
+# def _soft_open(x):
+#     return F.max_pool2d(_min_pool(x), 3, 1, 1)    # erode then dilate
+# def _soft_skel(x, iters=8):
+#     sk = F.relu(x - _soft_open(x))
+#     for _ in range(iters):
+#         x = _min_pool(x)
+#         delta = F.relu(x - _soft_open(x))
+#         sk = sk + F.relu(delta - sk * delta)
+#     return sk
+# def cldice(logit, gt, iters=8, smooth=1e-3):
+#     """1 - harmonic mean of (pred-skeleton in GT) and (GT-skeleton in pred)."""
+#     p = logit.sigmoid()[None, None]; g = gt[None, None]
+#     sp, sg = _soft_skel(p, iters), _soft_skel(g, iters)
+#     tprec = (sp * g).sum() / (sp.sum() + smooth)   # pred centerline inside GT
+#     tsens = (sg * p).sum() / (sg.sum() + smooth)   # GT centerline inside pred
+#     return 1 - 2 * tprec * tsens / (tprec + tsens + smooth)
+
+
+def _bce_term(logit, gt):
+    """Pos-weighted BCE, optionally focal-modulated (down-weights easy pixels)."""
+    pw = torch.tensor([POS_WEIGHT], device=device)
+    if FOCAL_GAMMA > 0:
+        ce = F.binary_cross_entropy_with_logits(logit, gt, pos_weight=pw, reduction="none")
+        p = logit.sigmoid()
+        pt = torch.where(gt > 0.5, p, 1 - p)          # prob of the true class
+        return ((1 - pt) ** FOCAL_GAMMA * ce).mean()
+    return F.binary_cross_entropy_with_logits(logit, gt, pos_weight=pw)
+
+
 def seg_loss(seg, fault_field, closure_field):
-    """Dense BCE (pos-weighted for thin faults) + soft-dice, per class channel."""
-    pw = torch.tensor([50.0], device=device)
-    lf = F.binary_cross_entropy_with_logits(seg[0], fault_field, pos_weight=pw) + _dice(seg[0], fault_field)
-    lc = F.binary_cross_entropy_with_logits(seg[1], closure_field, pos_weight=pw) + _dice(seg[1], closure_field)
+    """Dense per-channel loss = pos-weighted BCE (focal-modulated) + soft-dice,
+    per class channel. Config-driven (POS_WEIGHT / FOCAL_GAMMA) so experiments/
+    can ablate without editing this file."""
+    lf = _bce_term(seg[0], fault_field) + _dice(seg[0], fault_field)
+    lc = _bce_term(seg[1], closure_field) + _dice(seg[1], closure_field)
     return lf + lc
 
 

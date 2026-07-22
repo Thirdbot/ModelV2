@@ -16,22 +16,24 @@ import torch
 
 from hybrid.data.dataset import load_local_csv
 from hybrid.model.scenes import CSV
-from hybrid.model.narrator import facts_to_kv, narration_target
+from hybrid.model.narrator import facts_to_kv, narration_target, qualitative
 
 LM_EPOCHS = 150
-MAX_ROWS = 40
+MAX_ROWS = 500
 
 
 def narration_rows(facts_by_img):
-    """(injected facts, preamble+answer target). Inject facts_to_kv (same as inference);
-    target = the fact preamble (copy) + the row's grounded answer (reasoning). One row per
-    (image, answer) so the reasoning varies while the fact preamble stays correspondence-exact."""
+    """(injected facts, target, question) — standard Q+A: the row's QUESTION is the prompt,
+    target = fact preamble (copy) + qualitative narrative (grounding) + empty <think> + the
+    grounded answer that responds to the question. Numbers only in the preamble (backed)."""
     out = []
     for r in load_local_csv(csv_path=CSV):
         facts = facts_by_img.get((r.get("image_paths") or [None])[0])
         if facts is None or not facts["faults"]:
             continue
-        out.append((facts_to_kv(facts), narration_target(facts, r.get("answer") or "")))
+        ev, an, q = r.get("evidence") or "", r.get("answer") or "", r.get("question") or ""
+        instr = r.get("instruction") or ""
+        out.append((facts_to_kv(facts), narration_target(facts, qualitative(ev), an), q, instr))
         if len(out) >= MAX_ROWS:
             break
     return out
@@ -46,9 +48,9 @@ def train_narrator(nar, facts_by_img, epochs=LM_EPOCHS):
     print(f"[narrator] grounded narration on {len(data)} rows", flush=True)
     for ep in range(epochs):
         tot = 0.0
-        for kv, target in data:
+        for kv, target, question, instr in data:
             opt.zero_grad()
-            loss = nar.ground_loss(kv, target)
+            loss = nar.ground_loss(kv, target, question=question, instruction=instr)   # chatml Q+A
             loss.backward(); opt.step(); tot += loss.item()
         if ep % 10 == 0 or ep == epochs - 1:
             print(f"[narrator] ep {ep} loss {tot/max(1, len(data)):.3f}", flush=True)

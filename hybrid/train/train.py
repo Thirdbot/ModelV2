@@ -29,10 +29,10 @@ device = torch.device("cuda")
 SEED = 42
 # ---- fast overfit config: cap the dataset so the whole model trains in ~15 min.
 # Raise these (or set OVERFIT=False) for a full generalization run.
-OVERFIT = True        # quick overfit (verify pipeline before real data)
+OVERFIT = False      # ~1-hour full-ish run (all train scenes, capped rows)
 SCENE_CAP = 24        # (only used when OVERFIT)
-VIS_EPOCHS = 120
-LM_EPOCHS = 80       # grounded-narration epochs (Stage 3, fuse only)
+VIS_EPOCHS = 35
+LM_EPOCHS = 12       # grounded-QA epochs (Stage 3, fuse only); ~matches the confirmation step count
 EVAL_N = 5            # scenes per split in eval (greedy gen is slow)
 
 

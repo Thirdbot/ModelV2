@@ -20,6 +20,16 @@ device = torch.device("cuda")
 K_COUNT, K_DIP, K_EVID, K_NCLOSURE, K_AREA, K_BBOX, K_THROW = 0, 1, 2, 3, 4, 5, 6
 FAULT_LINE = re.compile(r"[Ff]ault\s+\d+[^.]*?dips at\s+(?:about\s+)?(?:<nums>)?([\d.]+)")
 
+# Unified chatml prompt: facts live in the SYSTEM turn (vision supplies them — a real
+# user never types measurements); the user turn is the question only. One skeleton across
+# all stages so geology's <think> (trained under <|im_start|>assistant) fires everywhere.
+INSTRUCTION_S2 = ("Report the measured evidence for each region. State values directly; "
+                  "end each line with a segmentation marker.")
+INSTRUCTION_S3 = ("Answer the question with concise geological evidence. Reference specific "
+                  "objects using object tags. Insert one segmentation marker at the end of each "
+                  "region-specific evidence line. State the measured values directly. Do not add "
+                  "facts unsupported by the image.")
+
 
 def faults_of(scene_objs):
     """GT per-fault dips (cls==1 with a dip present), in region order."""
@@ -125,16 +135,31 @@ def fact_preamble(facts):
     return " ".join(parts)
 
 
-def grounding_target(facts):
-    """Stage-2 target: the fact preamble as the evidence content (the copy zone)."""
-    return " ".join(f"<evidence> {fact_preamble(facts)} <SEG> </evidence>".split())
+def qualitative(ev):
+    """The evidence's DOMAIN LANGUAGE with numbers + tags removed — the seismic grounding that
+    keeps reasoning on-domain (the narrative that made the reasoning transfer work), WITHOUT
+    unbacked numbers. Drops all tags (keeping inner text) and keeps only digit-free sentences;
+    the preamble owns the facts, this owns the domain."""
+    t = re.sub(r"<[^>]+>", " ", ev)                      # drop all tags, keep inner text
+    sents = re.split(r"(?<=[.])\s+", t)
+    keep = [s.strip() for s in sents if s.strip() and not re.search(r"\d", s)]
+    return " ".join(" ".join(keep).split())
 
 
-def narration_target(facts, answer):
-    """Stage-3 target: fact preamble (copy) + empty <think></think> PLACEHOLDER + the grounded
-    answer. Numbers live in the preamble (all injected); the answer carries interpretation. The
-    <think> stays a supervised empty placeholder — reasoning is deferred to a reason set / later."""
-    return " ".join(f"<evidence> {fact_preamble(facts)} <SEG> </evidence> <think></think> {answer}".split())
+def grounding_target(facts, narrative=""):
+    """Stage-2 target: fact preamble (copy) + qualitative narrative (domain grounding). EVIDENCE
+    ZONE ONLY — stage 2's job is grounding. The <think>/<answer> resolution is stage 3's (the fuse
+    composes geology's reasoning-after-evidence + the answer), deferred to the skeleton step."""
+    return " ".join(f"<evidence> {fact_preamble(facts)} {narrative} <SEG> </evidence>".split())
+
+
+def narration_target(facts, narrative, answer):
+    """Stage-3 target: preamble (copy) + qualitative narrative (domain grounding) + empty
+    <think></think> placeholder + the grounded answer. Numbers live only in the preamble
+    (backed); the narrative grounds the seismic domain (the language reasoning transfers from)."""
+    return " ".join(
+        f"<evidence> {fact_preamble(facts)} {narrative} <SEG> </evidence> "
+        f"<think></think> {answer}".split())
 
 
 def structured_evidence(ev):
@@ -174,7 +199,6 @@ class Narrator:
         self.dec, self.tok = self.model.decoder, self.model.tokenizer
         self.emb = self.dec.get_input_embeddings()
         self.facts_mod = FactTokens(self.emb.embedding_dim, self.emb, self.tok).to(device)
-        self.p_emb = self.emb(self.tok(prompt, return_tensors="pt").input_ids.to(device)).squeeze(0)
 
     def set_stage(self, stage):
         self.model.set_stage(stage)
@@ -182,53 +206,63 @@ class Narrator:
     def trainable_params(self):
         return list(self.facts_mod.parameters()) + [q for q in self.dec.parameters() if q.requires_grad]
 
-    def _lm_loss(self, ft, target_str):
-        tgt = self.tok(target_str, return_tensors="pt").input_ids.to(device)
-        inp = torch.cat([ft, self.p_emb, self.emb(tgt).squeeze(0)], 0).unsqueeze(0)
-        labels = torch.cat([torch.full((ft.shape[0] + self.p_emb.shape[0],), -100, device=device),
-                            tgt.squeeze(0)], 0).unsqueeze(0)
+    def _emb_text(self, s):
+        ids = self.tok(s, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+        return self.emb(ids).squeeze(0)
+
+    def build_prompt(self, ft, instruction, question=None):
+        """Chatml prompt with the measured facts (ft) spliced into the SYSTEM turn — vision
+        supplies facts, the user only asks. question=None -> no user turn (S2 grounding). Ends
+        at '<|im_start|>assistant\\n' so geology's trained <think> trigger is present."""
+        pre = self._emb_text(f"<|im_start|>system\n{instruction}\nMeasured facts: ")
+        if question:
+            post = self._emb_text(f"<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n"
+                                  f"<|im_start|>assistant\n")
+        else:
+            post = self._emb_text("<|im_end|>\n<|im_start|>assistant\n")
+        return torch.cat([pre, ft, post], 0)
+
+    def _lm_loss(self, prompt_emb, target_str):
+        tgt = self.tok(target_str + "<|im_end|>", add_special_tokens=False,
+                       return_tensors="pt").input_ids.to(device)
+        inp = torch.cat([prompt_emb, self.emb(tgt).squeeze(0)], 0).unsqueeze(0)
+        labels = torch.cat([torch.full((prompt_emb.shape[0],), -100, device=device),
+                            tgt.squeeze(0)], 0).unsqueeze(0)                    # prompt masked
         return self.dec(inputs_embeds=inp, labels=labels).loss
 
-    def ground_loss(self, kv, target, max_kv=16):
-        """Inject ROLE-TAGGED facts (kind_marker, value_str); target = the grounded
-        text that contains those numbers inline. Each number carries its role, so a
-        dip can only land in the dip phrase. Used by S2 grounding + S3 narration."""
-        return self._lm_loss(self.facts_mod(kv[:max_kv]), target)
+    def ground_loss(self, kv, target, question=None, instruction=None, max_kv=16):
+        """Inject role-tagged facts into the SYSTEM turn; supervise the assistant target.
+        S2 grounding: instruction=INSTRUCTION_S2, question=None. S3 QA: the dataset
+        instruction + the question."""
+        ft = self.facts_mod(kv[:max_kv])
+        return self._lm_loss(self.build_prompt(ft, instruction or INSTRUCTION_S3, question), target)
 
     @torch.no_grad()
-    def narrate(self, kv, question=None, max_new_tokens=160):
-        """Inference: inject the role-tagged (detected/GT) facts, generate the grounded
-        narration freely — the LM copies each number into its role's phrase through the
-        learned latent. No slots, no replacement: the injected numbers are the only
-        NUMBER source (decoupled facts seam), and the LM generates the tags + text itself."""
+    def narrate(self, kv, question=None, instruction=None, max_new_tokens=160):
+        """Inference: inject the role-tagged (detected/GT) facts into the system turn, ask the
+        question in the user turn, generate the grounded chain freely — the LM copies each
+        number into its role's phrase. The injected numbers are the only NUMBER source."""
         ft = self.facts_mod(kv[:16])
-        if question:
-            head = self.emb(self.tok(f"\nQuestion: {question}\n",
-                                     return_tensors="pt").input_ids.to(device)).squeeze(0)
-        else:
-            head = self.p_emb
-        g = self.dec.generate(inputs_embeds=torch.cat([ft, head], 0).unsqueeze(0),
-                              max_new_tokens=max_new_tokens, do_sample=False,
-                              repetition_penalty=1.3, pad_token_id=self.tok.eos_token_id)
+        prompt = self.build_prompt(ft, instruction or INSTRUCTION_S3, question)
+        g = self.dec.generate(inputs_embeds=prompt.unsqueeze(0), max_new_tokens=max_new_tokens,
+                              do_sample=False, repetition_penalty=1.3,
+                              pad_token_id=self.tok.eos_token_id)
         return self.tok.decode(g[0], skip_special_tokens=True).strip()
 
     @torch.no_grad()
-    def generate(self, facts, max_new_tokens=160):
-        """Grounded narration from structured facts via the role-tagged bridge."""
-        return self.narrate(facts_to_kv(facts), max_new_tokens=max_new_tokens)
+    def generate(self, facts, max_new_tokens=160, question=None, instruction=None):
+        """Grounded narration/answer from structured facts via the role-tagged bridge,
+        optionally conditioned on a question (the user turn)."""
+        return self.narrate(facts_to_kv(facts), question=question, instruction=instruction,
+                            max_new_tokens=max_new_tokens)
 
     @torch.no_grad()
     def generate_reasoning(self, vals, question, max_new_tokens=120):
-        """Grounded reasoning that inherits the S2 grounding: inject the dip facts
-        (role-tagged), ask a step-by-step question, let the emergent CoT run through
-        the grounded latent. Proven in the evidence-copy grounding transfer test."""
-        ft = self.facts_mod([(K_DIP, f"{v:g}") for v in vals[:6]])
-        q = self.tok(f"\nQuestion: {question}\nThink step by step.\n",
-                     return_tensors="pt").input_ids.to(device)
-        g = self.dec.generate(inputs_embeds=torch.cat([ft, self.emb(q).squeeze(0)], 0).unsqueeze(0),
-                              max_new_tokens=max_new_tokens, do_sample=False,
-                              repetition_penalty=1.3, pad_token_id=self.tok.eos_token_id)
-        return self.tok.decode(g[0], skip_special_tokens=True).strip()
+        """Grounded reasoning: inject the dip facts (system turn), ask a step-by-step question
+        (user turn), let geology's <think> run through the grounded latent."""
+        return self.narrate([(K_DIP, f"{v:g}") for v in vals[:6]],
+                            question=f"{question} Think step by step.",
+                            instruction=INSTRUCTION_S3, max_new_tokens=max_new_tokens)
 
     def train_mode(self):
         self.dec.train(); self.facts_mod.train()
