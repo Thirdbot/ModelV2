@@ -256,6 +256,76 @@ def build_real_scenes():
     return scenes
 
 
+def build_real_windows(w_win=160, h_win=512, limit_lines=None):
+    """WINDOWED build (memory-safe): one fault-centred window per crossing, cropped to
+    ~synthetic scale (h_win x w_win). Each scene's smap is ~1MB (vs ~320MB full-line), so
+    peak RAM stays ~1 line (~130MB) + the small accumulated scenes — no freeze. Dip is read
+    from the windowed segment; throw from the FULL line (more horizon support)."""
+    assert segyio is not None, "pip install segyio"
+    faults = load_fault_sticks(); horizons = load_horizons()
+    print(f"[real-win] {len(faults)} faults · {len(horizons)} horizons · window {h_win}x{w_win}", flush=True)
+    enc = NcsEncoder().to(device).eval()
+    RENDER_DIR.mkdir(parents=True, exist_ok=True)
+    scenes = []
+    lines = [p for p in sorted(SEGY_DIR.rglob("*"))
+             if not p.is_dir() and p.suffix.lower() not in (".xml", ".txt", ".pdf")]
+    for li, segy in enumerate(lines[:limit_lines] if limit_lines else lines):
+        try:
+            data, cx, cy, samples = read_segy(segy)
+        except Exception as e:
+            print(f"[real-win] skip {segy.name}: {e}", flush=True); continue
+        img_full = _to_image(data); H, W = img_full.shape
+        crossings = project_faults(faults, cx, cy, samples, (H, W))
+        del data
+        for name, poly in crossings:
+            thr = _throw(poly, cx, cy, horizons)                 # full-line throw
+            fc, fr = int(np.median(poly[:, 0])), int(np.median(poly[:, 1]))
+            c0 = int(np.clip(fc - w_win // 2, 0, max(0, W - w_win))); c1 = min(W, c0 + w_win)
+            r0 = int(np.clip(fr - h_win // 2, 0, max(0, H - h_win))); r1 = min(H, r0 + h_win)
+            wp = poly.astype(float).copy(); wp[:, 0] -= c0; wp[:, 1] -= r0
+            inb = (wp[:, 0] >= 0) & (wp[:, 0] < c1 - c0) & (wp[:, 1] >= 0) & (wp[:, 1] < r1 - r0)
+            wp = wp[inb]
+            if len(wp) < MIN_FAULT_PTS:
+                continue
+            dip = _line_dip(wp)
+            if dip is None:
+                continue
+            hw = (r1 - r0, c1 - c0)
+            m = dilate(_rasterize(wp, hw).to(device)).cpu()
+            xs, ys = wp[:, 0], wp[:, 1]
+            obj = dict(cls=1, bbox=[xs.min() / hw[1], ys.min() / hw[0], xs.max() / hw[1], ys.max() / hw[0]],
+                       mask=m, meas=torch.tensor([dip, thr or 0.0, 0.0]),
+                       mmask=torch.tensor([1.0, 1.0 if thr is not None else 0.0, 0.0]),
+                       true_dip=None, name=name)
+            png = RENDER_DIR / f"{segy.parent.name}__{segy.name}__{name}_{c0}_{r0}.png"
+            Image.fromarray(img_full[r0:r1, c0:c1]).save(png)
+            try:
+                smap, _ = stitch(enc, str(png))
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache(); continue
+            scenes.append(dict(smap=smap.cpu(), hw=hw, objs=[obj], img=str(png),
+                               fault_field=m, closure_field=torch.zeros(hw)))
+            del smap; torch.cuda.empty_cache()
+        del img_full
+        print(f"[real-win] line {li+1}/{len(lines)} {segy.name}: {len(scenes)} windows total", flush=True)
+    return scenes
+
+
+WINDOW_CACHE = REAL_ROOT / "real_windows.pt"
+
+
+def load_real_windows(test_frac=0.25, rebuild=False):
+    if WINDOW_CACHE.exists() and not rebuild:
+        scenes = torch.load(WINDOW_CACHE, weights_only=False)
+    else:
+        scenes = build_real_windows()
+        torch.save(scenes, WINDOW_CACHE)
+        print(f"[real-win] saved {len(scenes)} windows -> {WINDOW_CACHE}", flush=True)
+    rng = random.Random(SEED); idx = list(range(len(scenes))); rng.shuffle(idx)
+    cut = int(len(idx) * (1 - test_frac))
+    return scenes, [scenes[i] for i in idx[:cut]], [scenes[i] for i in idx[cut:]]
+
+
 SCENE_CACHE = REAL_ROOT / "real_scenes.pt"
 
 

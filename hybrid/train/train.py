@@ -1,39 +1,36 @@
-"""Train the main model end to end.
+"""Train the main model end to end — reader + narrator + <SEG> mask decoder.
 
-Stage 2 : vision front-end (detector) -> per-fault dips.
-Stage 3 : facts-bridge narrator -> copies the numbers into grounded language.
-Then evaluate: held-out copy score + faithfulness swap.
+Stage 2 : instance READER (autoregressive; facts = count/class/dip/throw) — replaces
+          the dense-seg + RANSAC front-end.
+Stage 3 : chatml narrator (copies the numbers into grounded language) + the <SEG>
+          mask decoder (per-object content-prompted masks).
+Then evaluate on HELD-OUT: reader count/dip · copy fidelity · per-object mask dice.
 
+Stage 1 (geology adapter) is built once via `python -m hybrid.train.stage1_geology`.
 Run:  python -m hybrid.train.train
-
-Stage 1 (the geology adapter) is built once, out of band, via
-`python -m hybrid.train.stage1_geology`, and loaded frozen here.
 """
 import random
 from pathlib import Path
 
 import torch
 
-from hybrid.model.scenes import build_scenes, MEAS_SCALE
-from hybrid.model.narrator import Narrator, faults_of, scene_facts
-from hybrid.train.stage2_detector import (
-    train_detector, detected_facts, measure_accuracy, DIP_STRATA,
-)
+import hybrid.model.scenes as sc
+SCENE_CAP = 120                # cap for a quick-but-real held-out run (raise for a full run)
+sc.MAX_SCENES = SCENE_CAP
+
+from hybrid.model.scenes import build_scenes
+from hybrid.model.narrator import Narrator, faults_of, scene_facts, facts_to_kv, K_DIP
+from hybrid.train.stage_reader_mask import (
+    train_reader, reader_accuracy, reader_facts, train_mask_decoder, mask_accuracy)
 from hybrid.train.stage2_grounding import train_grounding
 from hybrid.train.stage3_narrator import train_narrator
-from hybrid.test.evaluate import evaluate
-from hybrid.inference.infer import collect_demo, save_overlays
-from hybrid.checkpoints import save_vision, save_narrator
+from hybrid.checkpoints import save_narrator
 
 device = torch.device("cuda")
 SEED = 42
-# ---- fast overfit config: cap the dataset so the whole model trains in ~15 min.
-# Raise these (or set OVERFIT=False) for a full generalization run.
-OVERFIT = False      # ~1-hour full-ish run (all train scenes, capped rows)
-SCENE_CAP = 24        # (only used when OVERFIT)
-VIS_EPOCHS = 35
-LM_EPOCHS = 12       # grounded-QA epochs (Stage 3, fuse only); ~matches the confirmation step count
-EVAL_N = 5            # scenes per split in eval (greedy gen is slow)
+READER_EPOCHS = 150
+LM_EPOCHS = 12
+CKPT = Path("hybrid/checkpoints")
 
 
 def load_split():
@@ -41,53 +38,51 @@ def load_split():
     scenes = [s for s in build_scenes() if faults_of(s["objs"])]
     idx = list(range(len(scenes))); rng.shuffle(idx)
     cut = int(len(idx) * 0.75)
-    return scenes, [scenes[i] for i in idx[:cut]], [scenes[i] for i in idx[cut:]], rng
+    return scenes, [scenes[i] for i in idx[:cut]], [scenes[i] for i in idx[cut:]]
+
+
+def _fmt(mn): return f"{mn[0]:.2f}(n{mn[1]})" if mn and mn[0] is not None else "n0"
 
 
 def main():
-    scale = MEAS_SCALE.to(device)
-    scenes, tr, te, rng = load_split()
-    tr_v = tr[:SCENE_CAP] if OVERFIT else tr
-    print(f"[train] scenes {len(scenes)} · train {len(tr)} (vision {len(tr_v)}) · test {len(te)}", flush=True)
+    scenes, tr, te = load_split()
+    print(f"[train] scenes {len(scenes)} · train {len(tr)} · test {len(te)}", flush=True)
 
-    def report_acc(tag):
-        """Mask/dip accuracy. PRED = dip via predicted mask (real); GT = via GT mask (ceiling)."""
-        def fmt(mn):
-            return f"{mn[0]:.1f}(n{mn[1]})" if mn[0] is not None else "n0"
-        for name, split in (("train", tr_v), ("test(held-out)", te[:SCENE_CAP])):
-            a = measure_accuracy(net, split, scale)
-            print(f"[acc {tag}] {name}: count MAE {fmt(a['count'])} · dice {fmt(a['dice'])} · "
-                  f"dip(pred) {fmt(a['dip_pred_all'])} · dip(GT) {fmt(a['dip_gt_all'])}", flush=True)
+    # ---- Stage 2: instance reader (facts) ----
+    reader = train_reader(tr, epochs=READER_EPOCHS)
+    for tag, sp in (("train", tr), ("test(held-out)", te)):
+        a = reader_accuracy(reader, sp)
+        print(f"[reader {tag}] count MAE {_fmt(a['count'])} · dip MAE {_fmt(a['dip'])}deg · "
+              f"class {a['cls'][0]}/{a['cls'][1]}", flush=True)
+    torch.save(reader.state_dict(), CKPT / "reader.pt")
 
-    # ---- Stage 2a vision: dense segmenter + throw (frozen from here on) ----
-    net = train_detector(tr_v, rng, scale, epochs=VIS_EPOCHS)
-    report_acc("vision")
-    save_vision(net, "stage3_vision.pt")
-
-    # ---- Stage 2b grounding: fact-preamble copy grounds the shared latent ----
-    # image -> GT facts: the target's fact preamble is built from these (correspondence), and
-    # facts_to_kv injects the SAME structure inference uses — so every marker has a home.
-    facts_by_img = {s["img"]: scene_facts(s) for s in tr_v}
+    # ---- Stage 3a/b: chatml narrator (copies facts into grounded language) ----
+    facts_by_img = {s["img"]: scene_facts(s) for s in tr}
     nar = Narrator()
     train_grounding(nar, facts_by_img)
-
-    # ---- Stage 3: fuse aligns the grounded narration (geology+grounding frozen).
-    # Target = fact preamble (copy zone, from measured facts) + grounded answer (free reasoning).
     train_narrator(nar, facts_by_img, epochs=LM_EPOCHS)
     save_narrator(nar, "stage3_narrator.pt")
 
-    # ---- end-to-end facts + overlays ----
-    te_f = sorted([s for s in te if faults_of(s["objs"])],
-                  key=lambda s: faults_of(s["objs"])[0])
-    picks = [te_f[i] for i in sorted(set(
-        [int(round(q * (len(te_f) - 1))) for q in (0.0, 0.25, 0.5, 0.75, 1.0)]))] if te_f else []
-    det_facts = {id(s): detected_facts(net, s) for s in te[:5] + picks}
-    demo = collect_demo(net, nar, picks, scale)
+    # ---- Stage 3c: <SEG> mask decoder (per-object, LM frozen) ----
+    mdec = train_mask_decoder(nar, tr)
+    for tag, sp in (("train", tr), ("test(held-out)", te)):
+        print(f"[mask {tag}] per-object dice {_fmt(mask_accuracy(nar, mdec, sp))}", flush=True)
+    torch.save(mdec.state_dict(), CKPT / "mask_decoder.pt")
 
-    # ---- evaluate + visual overlays ----
-    evaluate(nar, tr_v, te[:EVAL_N], det_facts)
-    paths = save_overlays(demo, Path("hybrid/inference_outputs"))
-    print(f"[demo] saved {len(paths)} overlays -> hybrid/inference_outputs", flush=True)
+    # ---- end-to-end held-out copy fidelity (reader-detected facts -> narration) ----
+    nar.eval_mode()
+    Q = "How many faults are present and what is each fault's dip?"
+    hit = tot = 0
+    for s in te[:20]:
+        facts = reader_facts(reader, s)
+        if not facts["faults"]:
+            continue
+        dips = [v for k, v in facts_to_kv(facts) if k == K_DIP]
+        out = nar.generate(facts, question=Q, max_new_tokens=140)
+        for d in dips:
+            tot += 1; hit += (d in out)
+    print(f"[copy held-out] reader-facts copied {hit}/{tot}", flush=True)
+    print("MAIN_MODEL_DONE", flush=True)
 
 
 if __name__ == "__main__":

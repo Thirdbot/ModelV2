@@ -264,6 +264,20 @@ class Narrator:
                             question=f"{question} Think step by step.",
                             instruction=INSTRUCTION_S3, max_new_tokens=max_new_tokens)
 
+    def seg_hidden(self, kv, target, instruction=None, question=None, max_kv=16):
+        """LM forward on prompt+target; return the hidden state at each <SEG> token
+        (n_seg, lm_dim) — the content prompt for the mask decoder — and the <SEG> count.
+        Wrap in no_grad for a frozen-LM mask decoder; leave open for joint fine-tune."""
+        from hybrid.model.mask_decoder import seg_positions
+        ft = self.facts_mod(kv[:max_kv])
+        prompt = self.build_prompt(ft, instruction or INSTRUCTION_S3, question)
+        tgt = self.tok(target + "<|im_end|>", add_special_tokens=False,
+                       return_tensors="pt").input_ids.to(device)[0]
+        inp = torch.cat([prompt, self.emb(tgt.unsqueeze(0)).squeeze(0)], 0).unsqueeze(0)
+        hs = self.dec(inputs_embeds=inp, output_hidden_states=True).hidden_states[-1][0]
+        pos = seg_positions(self.tok, tgt)
+        return hs[[prompt.shape[0] + p for p in pos]], len(pos)
+
     def train_mode(self):
         self.dec.train(); self.facts_mod.train()
 
