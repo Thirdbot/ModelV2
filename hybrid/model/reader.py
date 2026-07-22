@@ -31,7 +31,7 @@ def scene_to_gt(scene):
         x1, y1, x2, y2 = o["bbox"]
         ctr = torch.tensor([(y1 + y2) / 2, (x1 + x2) / 2], device=device, dtype=torch.float32)
         mfw = F.adaptive_avg_pool2d(o["mask"][None, None].float(), (fH, fW))[0, 0].clamp(0, 1)
-        g = dict(cls=c, ctr=ctr, mask_fW=mfw)
+        g = dict(cls=c, ctr=ctr, mask_fW=mfw, mask_full=o["mask"])
         g["dip"] = float(o["meas"][0]) if (c == 1 and float(o["mmask"][0]) > 0) else None
         g["throw"] = float(o["meas"][1]) if (c == 1 and float(o["mmask"][1]) > 0) else None
         g["area"] = float(o["meas"][2]) if (c == 2 and float(o["mmask"][2]) > 0) else None
@@ -63,6 +63,14 @@ class InstanceReader(nn.Module):
         self.dip_head = nn.Sequential(nn.Linear(7, 64), nn.GELU(), nn.Linear(64, 1))    # SPATIAL stats → dip
         self.throw_head = nn.Sequential(nn.Linear(d, 64), nn.GELU(), nn.Linear(64, 1))  # POOLED → throw
         self.area_head = nn.Sequential(nn.Linear(d, 64), nn.GELU(), nn.Linear(64, 1))   # POOLED → area
+        # Mask head (Mask2Former-style): instance query · UPSAMPLED pixel-decoder features →
+        # per-instance mask. Shares the trunk with the reader → mask loss co-trains the pixel
+        # decoder (couples facts + masks in Stage 2; no LM dependency). The query is the content prompt.
+        self.mask_q = nn.Linear(d, d)
+        mlrs = [nn.Conv2d(d, d, 3, padding=1), nn.GroupNorm(8, d), nn.GELU()]
+        for _ in range(3):
+            mlrs += [nn.ConvTranspose2d(d, d, 4, stride=2, padding=1), nn.GroupNorm(8, d), nn.GELU()]
+        self.mask_up = nn.Sequential(*mlrs, nn.Conv2d(d, d, 1))     # 8× upsample → mask features
 
     def _grid(self, smap):
         """smap (vdim,fH,fW) -> memory tokens (1,fHW,d), and the (row,col) coords."""
@@ -93,6 +101,10 @@ class InstanceReader(nn.Module):
         return dict(stop=self.stop_head(h).squeeze(-1), cls=self.class_head(h),
                     dip=self.dip_head(stats).squeeze(-1), throw=self.throw_head(pooled).squeeze(-1),
                     area=self.area_head(pooled).squeeze(-1), foot=foot, foot_logits=occ_logits, mu=mu)
+
+    def _mask_features(self, memory, fH, fW):
+        """Pixel-decoder trunk features (1,fHW,d) → upsampled per-pixel mask features (1,d,H',W')."""
+        return self.mask_up(memory.transpose(1, 2).reshape(1, self.d, fH, fW))
 
     def _seq_embed(self, classes, centroids):
         """Embed a prefix of GT/emitted objects for teacher forcing / AR decode."""
