@@ -151,13 +151,26 @@ class InstanceReader(nn.Module):
                 ga = torch.tensor([o.get("area") or 0.0 for o in gt], device=device)[clo] / 100.0
                 al = F.smooth_l1_loss(out["area"][0, :K][clo], ga)
                 L = L + al; parts["area"] = al.item()
+            mfull = [o.get("mask_full") for o in gt]
+            if any(mm is not None for mm in mfull):
+                mfeat = self._mask_features(memory, fH, fW)            # (1,d,H',W')
+                ml = torch.einsum("kd,dhw->khw", self.mask_q(h[0, :K]), mfeat[0])  # (K,H',W')
+                Ht, Wt = mfull[0].shape
+                ml = F.interpolate(ml.unsqueeze(0), size=(Ht, Wt), mode="bilinear", align_corners=False)[0]
+                gm2 = torch.stack([mm.to(device) for mm in mfull]).float().clamp(0, 1)
+                p2 = ml.sigmoid(); pw2 = torch.tensor([40.0], device=device)
+                mk = (F.binary_cross_entropy_with_logits(ml, gm2, pos_weight=pw2)
+                      + 1 - (2 * (p2 * gm2).sum() + 1) / (p2.sum() + gm2.sum() + 1))
+                L = L + mk; parts["mask"] = mk.item()
         return L, parts
 
     @torch.no_grad()
-    def detect(self, smap, thresh=0.5):
-        """Greedy autoregressive decode → list of {cls, dip, throw, area, ctr}."""
-        memory, coord, _ = self._grid(smap)
-        objs, cls_hist, ctr_hist = [], [], []
+    def detect(self, smap, thresh=0.5, want_masks=False):
+        """Greedy autoregressive decode → list of {cls, dip, throw, area, ctr}. With
+        want_masks, also returns per-instance mask logits (H',W') from the query."""
+        memory, coord, (fH, fW) = self._grid(smap)
+        mfeat = self._mask_features(memory, fH, fW) if want_masks else None
+        objs, masks, cls_hist, ctr_hist = [], [], [], []
         for _ in range(self.max_steps):
             cls_t = torch.tensor(cls_hist, device=device).unsqueeze(0) if cls_hist else torch.zeros(1, 0, dtype=torch.long, device=device)
             ctr_t = torch.stack(ctr_hist).unsqueeze(0) if ctr_hist else torch.zeros(1, 0, 2, device=device)
@@ -174,5 +187,7 @@ class InstanceReader(nn.Module):
                              throw=float(out["throw"][0, 0] * 500.0),
                              area=float(out["area"][0, 0] * 100.0),
                              ctr=out["mu"][0, 0].detach()))
+            if want_masks:
+                masks.append(torch.einsum("bd,dhw->bhw", self.mask_q(h[:, -1]), mfeat[0])[0])
             cls_hist.append(c); ctr_hist.append(out["mu"][0, 0].detach())
-        return objs
+        return (objs, masks) if want_masks else objs
